@@ -16,7 +16,7 @@ const stateDir = () => {
   return `${home()}/.cache/herdr-todos/${key}`;
 };
 // Spaces on another machine ("m1/sp…") are read there: the helper is piped through herdr-core to
-// that machine's Node, so its Pi journals, git roots, model logins and memories.md stay on it and
+// that machine's Node, so its Pi journals, git roots, model logins and MEMORIES.md stay on it and
 // both ends always run this same version of the helper.
 const REMOTE_STATE = "~/.cache/herdr-todos/remote";
 const where = (space) => {
