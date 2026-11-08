@@ -161,43 +161,62 @@ function textOf(content) {
 
 // Reads only what was appended since the last scan: session names, the first request and the
 // latest task-board snapshot. Journals are append-only; a shrunk file is rescanned.
+// Picks what we keep from one journal line: session names, the first request, the latest board.
+function scanLine(entry, line) {
+  if (!line) return;
+  if (line.includes('"session_info"')) {
+    try {
+      const e = JSON.parse(line);
+      if (e.type === "session_info") entry.name = typeof e.name === "string" && e.name.trim() ? e.name.trim() : null;
+    } catch {}
+  } else if (line.includes('"herdr-pi-todos/v1"')) {
+    try {
+      const e = JSON.parse(line);
+      if (e.type === "custom" && e.customType === "herdr-pi-todos/v1" && Array.isArray(e.data?.tasks)) {
+        entry.board = e.data.tasks.map((t) => ({ id: t.id, subject: t.subject, status: t.status, activeForm: t.activeForm || null, priority: t.priority }));
+        entry.boardAt = e.timestamp || null;
+      }
+    } catch {}
+  } else if (!entry.first && line.includes('"role":"user"')) {
+    try {
+      const e = JSON.parse(line);
+      if (e.type === "message" && e.message?.role === "user") entry.first = textOf(e.message.content).slice(0, 1500) || null;
+    } catch {}
+  }
+}
+
 async function scanFile(file, stat, prev) {
   let entry = prev && prev.size <= stat.size && prev.ino === stat.ino ? { ...prev } : { offset: 0, name: null, first: null, board: null, boardAt: null };
   entry.size = stat.size;
   entry.mtime = stat.mtimeMs;
   entry.ino = stat.ino;
   if (entry.offset >= stat.size) return entry;
+  // Read in chunks: journals can be hundreds of megabytes.
+  const CHUNK = 8 * 1024 * 1024;
   const fh = await fs.open(file, "r");
   try {
-    const length = stat.size - entry.offset;
-    const buf = Buffer.alloc(length);
-    await fh.read(buf, 0, length, entry.offset);
-    const lastNl = buf.lastIndexOf(10);
-    if (lastNl < 0) return entry;
-    const text = buf.subarray(0, lastNl).toString("utf8");
-    for (const line of text.split("\n")) {
-      if (!line) continue;
-      if (line.includes('"session_info"')) {
-        try {
-          const e = JSON.parse(line);
-          if (e.type === "session_info") entry.name = typeof e.name === "string" && e.name.trim() ? e.name.trim() : null;
-        } catch {}
-      } else if (line.includes('"herdr-pi-todos/v1"')) {
-        try {
-          const e = JSON.parse(line);
-          if (e.type === "custom" && e.customType === "herdr-pi-todos/v1" && Array.isArray(e.data?.tasks)) {
-            entry.board = e.data.tasks.map((t) => ({ id: t.id, subject: t.subject, status: t.status, activeForm: t.activeForm || null, priority: t.priority }));
-            entry.boardAt = e.timestamp || null;
-          }
-        } catch {}
-      } else if (!entry.first && line.includes('"role":"user"')) {
-        try {
-          const e = JSON.parse(line);
-          if (e.type === "message" && e.message?.role === "user") entry.first = textOf(e.message.content).slice(0, 1500) || null;
-        } catch {}
+    let carry = Buffer.alloc(0);
+    let pos = entry.offset;
+    while (pos < stat.size) {
+      const length = Math.min(CHUNK, stat.size - pos);
+      const buf = Buffer.alloc(length);
+      await fh.read(buf, 0, length, pos);
+      pos += length;
+      const data = carry.length ? Buffer.concat([carry, buf]) : buf;
+      const lastNl = data.lastIndexOf(10);
+      if (lastNl < 0) {
+        // One line longer than a chunk (a huge tool result): skip it, it holds nothing we read.
+        if (data.length > 64 * 1024 * 1024) {
+          carry = Buffer.alloc(0);
+          entry.offset = pos;
+        } else carry = data;
+        continue;
       }
+      for (const line of data.subarray(0, lastNl).toString("utf8").split("\n")) scanLine(entry, line);
+      entry.offset += lastNl + 1 - (data.length - buf.length - (carry === data ? 0 : 0)) + (data.length - buf.length);
+      entry.offset = pos - (data.length - lastNl - 1);
+      carry = data.subarray(lastNl + 1);
     }
-    entry.offset += lastNl + 1;
   } finally {
     await fh.close();
   }
@@ -228,6 +247,19 @@ async function listSessionFiles(dir, index) {
     out.push({ file, ...index.files[file] });
   }
   return out;
+}
+
+// Pi's session folders touched recently, newest first.
+async function recentSessionDirs() {
+  const root = path.join(piAgentDir, "sessions");
+  const cutoff = Date.now() - RECENT_FILE_DAYS * 86400_000;
+  const names = await fs.readdir(root).catch(() => []);
+  const dirs = [];
+  for (const n of names) {
+    const st = await fs.stat(path.join(root, n)).catch(() => null);
+    if (st?.isDirectory() && st.mtimeMs >= cutoff) dirs.push({ dir: path.join(root, n), at: st.mtimeMs });
+  }
+  return dirs.sort((a, b) => b.at - a.at).map((d) => d.dir);
 }
 
 // The active branch's recent conversation: the newest entry, then its parents.
@@ -340,10 +372,24 @@ async function mapTerminals(terms, index, previous) {
     if (result.has(t.address)) continue;
     const cwd = t.foreground?.cwd || t.cwd;
     const files = await filesFor(cwd);
-    const name = ["working", "done"].includes(statusWord(t)) ? t.status?.msg?.trim() : null;
+    // Pi reports its session name while working or done, and titles its terminal
+    // "π - <session name> - <folder>" (the only clue while idle).
+    const title = (t.title ?? "").replace(/^π\s+-\s+/, "");
+    const fromTitle = title !== (t.title ?? "") && title.includes(" - ") ? title.slice(0, title.lastIndexOf(" - ")).trim() : null;
+    const name = (["working", "done"].includes(statusWord(t)) ? t.status?.msg?.trim() : null) || fromTitle || null;
     if (!name) continue;
     const prev = prevBy.get(t.address);
-    const matches = files.filter((f) => f.name === name && !claimed.has(f.file));
+    let matches = files.filter((f) => f.name === name && !claimed.has(f.file));
+    // A session started elsewhere keeps its first folder's journal (a moved or renamed folder,
+    // or a `cd` before starting): look through Pi's other recent folders for the name.
+    if (!matches.length) {
+      for (const dir of await recentSessionDirs()) {
+        if (dirs.has(dir)) continue;
+        dirs.set(dir, await listSessionFiles(dir, index));
+        matches = dirs.get(dir).filter((f) => f.name === name && !claimed.has(f.file));
+        if (matches.length) break;
+      }
+    }
     if (!matches.length) continue;
     const keep = prev && prev.pid === t.foreground?.pid && matches.find((m) => m.file === prev.file);
     const pick = keep ?? matches[0];
@@ -450,6 +496,8 @@ const INJECTED = [
   /^The conversation history above was just compacted/,
   /^Provider retry activated/,
   /^Inspect subagent updates above/,
+  /^Continue the original task from its last verified state/,
+  /^(?:Provider|Model) (?:retry|fallback|switch)/,
   /^\s*</,
   /^\[(?:subagent|hub|system|automated)/i,
 ];

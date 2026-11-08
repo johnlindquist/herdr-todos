@@ -14,7 +14,10 @@ A right-hand sidebar for the Herdr desktop app, in two halves:
 - **Every space is cached** in `~/.cache/herdr-todos/default/`, so switching spaces shows the
   last lists at once and then updates them. When the sidebar starts, it reads every space that has
   a Pi session in the background, one after another.
-- Remote spaces aren't read.
+- **Spaces on other machines** are read on that machine: the helper is piped through herdr-core
+  (`hc exec --on <machine> -i node`) so the machine's own journals, git roots and Pi login are used,
+  and kept memories are written into that machine's project. It needs Node and Pi there; without
+  them the panel says so. Its state lives in that machine's `~/.cache/herdr-todos/remote/`.
 
 ## Use it
 
@@ -44,7 +47,7 @@ A session seen for the first time contributes only its latest two prompts.
 - `memories.md` is the authority: delete a line by hand and it no longer counts as kept.
 
 Each line carries a hidden marker (`<!-- memory:id -->`) so removing and editing touch only that
-line. Sessions outside a git repository and spaces on other machines don't produce suggestions.
+line. Sessions outside a git repository don't produce suggestions.
 
 ## Install
 
@@ -54,12 +57,14 @@ line. Sessions outside a git repository and spaces on other machines don't produ
 ```
 
 The first install docks Todos on the right of the layout you're using. Memories has no dock spot
-of its own; put it under Todos with a column in the layout:
+of its own; put it under Todos with a column in the layout. Drag the line between them to resize;
+each half scrolls on its own and keeps at least its `min` height:
 
 ```json
-{ "id": "right-panel", "type": "column", "size": { "px": 304 }, "children": [
-  { "type": "block", "content": { "mod": "todos" }, "size": { "weight": 3 } },
-  { "id": "memories", "type": "block", "content": { "mod": "memories" }, "size": { "weight": 2 } } ] }
+{ "id": "right-panel", "type": "column", "size": { "px": 304 }, "divider": { "width": 1, "color": "border" },
+  "children": [
+    { "type": "block", "content": { "mod": "todos" }, "size": { "weight": 3 }, "min": 140 },
+    { "id": "memories", "type": "block", "content": { "mod": "memories" }, "size": { "weight": 2 }, "min": 120 } ] }
 ```
 
 ## For agents
@@ -85,8 +90,9 @@ sessions) or `missing` (never read); `busy: true` means another refresh holds th
 ## How a terminal is matched to its Pi session
 
 1. A `pi.session=<journal path>` label on the terminal, if something sets one.
-2. The session name Pi reports to Herdr, matched against `session_info` names in the journals
-   of Pi's folder for that working directory.
+2. The session name Pi reports to Herdr (or puts in the terminal title while idle), matched
+   against `session_info` names in the journals of Pi's folder for that working directory, then
+   in Pi's other recent folders (a session started before a `cd` or a folder rename).
 3. The journal used last time by the same Pi process.
 4. The newest unclaimed journal in that folder.
 

@@ -5,7 +5,7 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { agents, spaces, focused, panes, exec, home, appHome, run, theme, readTextFile, nextCommand } from "herdr";
+import { agents, spaces, focused, panes, exec, home, appHome, run, theme, readTextFile, nextCommand, shared, setShared } from "herdr";
 
 const NAME = "todos";
 const ICON = (n) => `mods/${NAME}/icons/${n}.svg`;
@@ -15,6 +15,42 @@ const stateDir = () => {
   const key = app === `${home()}/.config/herdr-app` ? "default" : app.replace(/[^A-Za-z0-9]/g, "_");
   return `${home()}/.cache/herdr-todos/${key}`;
 };
+// Spaces on another machine ("m1/sp…") are read there: the helper is piped through herdr-core to
+// that machine's Node, so its Pi journals, git roots, model logins and memories.md stay on it and
+// both ends always run this same version of the helper.
+const REMOTE_STATE = "~/.cache/herdr-todos/remote";
+const where = (space) => {
+  const i = space.indexOf("/");
+  return i < 0 ? { machine: null, id: space } : { machine: space.slice(0, i), id: space.slice(i + 1) };
+};
+function callHelper(machine, argv, timeout) {
+  if (!machine) return exec("node", [helper(), ...argv, "--state", stateDir()], { timeout });
+  return exec("sh", ["-c", 'm="$1"; shift; exec hc exec --on "$m" -i node --input-type=module - "$@" < "$0"', helper(), machine, ...argv, "--state", REMOTE_STATE], { timeout });
+}
+function helperError(r, machine) {
+  const text = r.stderr.trim();
+  if (machine && /cannot start node|node: (command )?not found|exec: node/i.test(text)) return `${machine} needs Node and Pi for Todos`;
+  try {
+    const e = JSON.parse(text.split("\n").pop());
+    return typeof e.message === "string" ? e.message : e.error?.message ?? text.slice(0, 200);
+  } catch {
+    return text.slice(0, 200) || `exit ${r.code}`;
+  }
+}
+// The helper on a machine knows its terminals as "t7"; this window knows them as "m1/t7".
+function fromMachine(doc, machine) {
+  if (!machine || !doc) return doc;
+  const q = (a) => `${machine}/${a}`;
+  return {
+    ...doc,
+    sessions: (doc.sessions ?? []).map((x) => ({ ...x, terminal: q(x.terminal) })),
+    prefs: doc.prefs && {
+      order: (doc.prefs.order ?? []).map(q),
+      priority: Object.fromEntries(Object.entries(doc.prefs.priority ?? {}).map(([k, v]) => [q(k), v])),
+    },
+  };
+}
+const bare = (addr, machine) => (machine && addr.startsWith(`${machine}/`) ? addr.slice(machine.length + 1) : addr);
 const stateFile = (space) => `${stateDir()}/spaces/${space.replace(/[^A-Za-z0-9_-]/g, "_")}.json`;
 
 const PERIODIC_MS = 60_000; // the shown space, while a session in it works
@@ -119,7 +155,7 @@ export default class Todos extends View {
   }
 
   want(space, cx, delay) {
-    if (!space || space.includes("/") || this.scheduled.has(space)) return;
+    if (!space || this.scheduled.has(space)) return;
     this.scheduled.add(space);
     cx.timer.after(Math.max(16, delay), (cx) => {
       this.scheduled.delete(space);
@@ -130,16 +166,24 @@ export default class Todos extends View {
   // Fills the cache for every space with a Pi session, one after another, so a first visit
   // to a space already has its lists.
   warm(cx) {
-    const ids = [...new Set(agents().filter((a) => a.app === "pi" && !a.space.includes("/")).map((a) => a.space))];
+    const ids = [...new Set(agents().filter((a) => a.app === "pi").map((a) => a.space))];
     ids.filter((id) => id !== this.shownSpace).forEach((id, i) => this.want(id, cx, 3000 + i * 2500));
   }
 
   load(space, cx) {
+    const { machine, id } = where(space);
     cx.spawn(async (cx) => {
       try {
-        const text = await readTextFile(stateFile(space));
-        if (text && !this.cache[space]) {
-          this.cache[space] = JSON.parse(text);
+        let doc = null;
+        if (!machine) {
+          const text = await readTextFile(stateFile(space));
+          doc = text ? JSON.parse(text) : null;
+        } else {
+          const r = await callHelper(machine, ["show", "--space", id], 60_000);
+          if (r.code === 0) doc = fromMachine(JSON.parse(r.stdout), machine);
+        }
+        if (doc && doc.state !== "missing" && !this.cache[space]) {
+          this.cache[space] = doc;
           cx.notify();
         }
       } catch {}
@@ -160,28 +204,25 @@ export default class Todos extends View {
     if (space === this.shownSpace) cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const argv = [helper(), "refresh", "--space", space, "--state", stateDir()];
+        const { machine, id } = where(space);
+        const argv = ["refresh", "--space", id];
         if (force) argv.push("--force");
-        const r = await exec("node", argv, { timeout: 240_000 });
+        const r = await callHelper(machine, argv, 300_000);
         if (r.code === 0) {
-          const doc = JSON.parse(r.stdout);
+          const doc = fromMachine(JSON.parse(r.stdout), machine);
           if (!doc.busy) {
             this.cache[space] = doc;
             // Adopt saved choices (an agent may have set them) unless edited here since this read began.
             if (!(this.editedAt[space] > (doc.updated_at ?? 0))) delete this.prefs[space];
           }
           delete this.errors[space];
-        } else {
-          let msg = r.stderr.trim();
-          try {
-            msg = JSON.parse(msg).message;
-          } catch {}
-          this.errors[space] = msg || `exit ${r.code}`;
-        }
+        } else this.errors[space] = helperError(r, machine);
       } catch (e) {
         this.errors[space] = String(e?.message ?? e);
       }
       this.lastRun[space] = Date.now();
+      // Memories (the panel below) reads suggestions this refresh may have added.
+      setShared("todos.updated", { ...(shared("todos.updated") ?? {}), [space]: Date.now() });
       this.busy.delete(space);
       if (this.again.delete(space)) this.refresh(space, cx, false);
       const next = this.waiting.shift();
@@ -206,8 +247,9 @@ export default class Todos extends View {
     this.editedAt[space] = Date.now();
     cx.spawn(async (cx) => {
       try {
-        const r = await exec("node", [helper(), ...argv, "--space", space, "--state", stateDir()], { timeout: 20_000 });
-        if (r.code !== 0) this.errors[space] = `Couldn't save: ${r.stderr.trim().slice(0, 160)}`;
+        const { machine, id } = where(space);
+        const r = await callHelper(machine, [...argv, "--space", id], 60_000);
+        if (r.code !== 0) this.errors[space] = `Couldn't save: ${helperError(r, machine)}`;
         else delete this.errors[space];
       } catch (e) {
         this.errors[space] = `Couldn't save: ${String(e?.message ?? e)}`;
@@ -225,7 +267,7 @@ export default class Todos extends View {
     list.splice(fromAt, 1);
     list.splice(fromAt < toAt ? list.indexOf(to) + 1 : list.indexOf(to), 0, from);
     this.prefs[sp] = { ...this.prefsFor(sp), order: list };
-    this.save(sp, ["order", "--terminals", list.join(",")], cx);
+    this.save(sp, ["order", "--terminals", list.map((a) => bare(a, where(sp).machine)).join(",")], cx);
   }
 
   setPriority(terminal, key, level, cx) {
@@ -237,7 +279,7 @@ export default class Todos extends View {
     if (level === "normal") delete priority[k];
     else priority[k] = level;
     this.prefs[sp] = { ...prefs, priority };
-    this.save(sp, ["priority", "--terminal", terminal, "--task", key, "--level", level], cx);
+    this.save(sp, ["priority", "--terminal", bare(terminal, where(sp).machine), "--task", key, "--level", level], cx);
     cx.notify();
   }
 
@@ -429,7 +471,6 @@ export default class Todos extends View {
     const space = spaces().find((s) => s.id === sp);
     const doc = sp ? this.cache[sp] : null;
     const busy = sp ? this.busy.has(sp) : false;
-    const remote = Boolean(space?.machine) || (sp ?? "").includes("/");
 
     // A terminal keeps its last report after Pi exits, so once the helper has read the space its
     // list decides which are Pi sessions; agents it hasn't seen yet show while a read is running.
@@ -463,7 +504,6 @@ export default class Todos extends View {
     const error = sp ? this.errors[sp] : null;
     let empty = null;
     if (!sp) empty = "No space shown";
-    else if (remote) empty = "Todos reads Pi sessions on this computer. This space is on another machine.";
     else if (!rows.length) empty = busy && !doc ? "Reading sessions…" : "No Pi sessions in this space";
 
     const header = h_flex()
@@ -508,7 +548,7 @@ export default class Todos extends View {
             .pt(16)
             .gap(6)
             .child(div().text_size(12.5).text_color(t.muted).child(empty))
-            .when(!remote && !busy && Boolean(sp) && !rows.length, (el) =>
+            .when(!busy && Boolean(sp) && !rows.length, (el) =>
               el.child(div().text_size(12).text_color(t.dim).child("Start Pi in a tab here. Its tasks show up after the first reply.")),
             ),
         ),
