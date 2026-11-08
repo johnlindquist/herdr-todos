@@ -269,14 +269,14 @@ async function recentConversation(file) {
       const t = textOf(m.content).trim();
       if (!t) continue;
       const s = t.length > 1800 ? t.slice(0, 1800) + " …" : t;
-      out.push({ role: "user", at: e.timestamp, text: s });
+      out.push({ id: e.id, role: "user", at: e.timestamp, text: s });
       used += s.length;
     } else if (m.role === "assistant") {
       const t = textOf(m.content).trim();
       const tools = Array.isArray(m.content) ? m.content.filter((p) => p?.type === "toolCall").map((p) => p.name) : [];
       if (t) {
         const s = t.length > 1400 ? t.slice(0, 700) + " … " + t.slice(-600) : t;
-        out.push({ role: "assistant", at: e.timestamp, text: s, tools: [...new Set([...tools, ...pendingTools])].slice(0, 8) });
+        out.push({ id: e.id, role: "assistant", at: e.timestamp, text: s, tools: [...new Set([...tools, ...pendingTools])].slice(0, 8) });
         used += s.length;
         pendingTools = [];
       } else if (tools.length) {
@@ -434,6 +434,244 @@ function boardTasks(board) {
     .sort((a, b) => order[a.status] - order[b.status]);
 }
 
+// ---------- memories ----------
+// Candidate guidance from the person's own messages, kept per project (git root) until the person
+// keeps or dismisses it. Kept ones live in <root>/memories.md, one line each, marked with an id;
+// <root>/AGENTS.md links to that file.
+
+const MEMORY_FILE = "memories.md";
+const MEMORY_HEADER = `# Memories
+
+Decisions and preferences from earlier work in this project. Follow them unless the current request says otherwise.
+`;
+const AGENTS_LINK = `Read [memories.md](memories.md) before you start: decisions and preferences from earlier work in this project. Follow them unless the current request says otherwise.`;
+const MAX_NEW_FIRST_SIGHT = 2; // a session seen for the first time: only its latest prompts
+const INJECTED = [
+  /^The conversation history above was just compacted/,
+  /^Provider retry activated/,
+  /^Inspect subagent updates above/,
+  /^\s*</,
+  /^\[(?:subagent|hub|system|automated)/i,
+];
+
+const memStoreFile = (root) => path.join(stateDir, "memories", `${root.replace(/[^A-Za-z0-9_-]/g, "_")}.json`);
+const norm = (t) => t.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+const newId = () => Math.random().toString(36).slice(2, 10);
+const marker = (id) => `<!-- memory:${id} -->`;
+
+async function gitRoot(cwd, cache) {
+  if (cache[cwd] !== undefined) return cache[cwd];
+  const r = await run("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { timeout: 5000 });
+  cache[cwd] = r.code === 0 ? r.stdout.trim() || null : null;
+  return cache[cwd];
+}
+
+// Waits for the lock instead of skipping: memory writes must not be lost.
+async function withWaitLock(name, fn) {
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    const r = await withLock(name, async () => ({ value: await fn() }));
+    if (r) return r.value;
+    if (Date.now() > deadline) throw new Error("memories are busy; try again");
+    await new Promise((res) => setTimeout(res, 150));
+  }
+}
+
+async function readStore(root) {
+  const s = await readJson(memStoreFile(root), null);
+  return s && Array.isArray(s.items) ? s : { version: VERSION, root, items: [], processed: {} };
+}
+
+async function readMemoryFile(root) {
+  return fs.readFile(path.join(root, MEMORY_FILE), "utf8").catch(() => null);
+}
+
+// The file is the authority for what is kept: a kept line someone deleted by hand is no longer kept.
+async function reconcile(store) {
+  const text = await readMemoryFile(store.root);
+  for (const m of store.items) {
+    if (m.status === "accepted" && !(text ?? "").includes(marker(m.id))) {
+      m.status = "removed";
+      m.updated_at = Date.now();
+    }
+  }
+  return store;
+}
+
+async function writeMemoryLine(root, id, text) {
+  const file = path.join(root, MEMORY_FILE);
+  let body = (await readMemoryFile(root)) ?? MEMORY_HEADER;
+  const line = `- ${text.replace(/\s+/g, " ").trim()} ${marker(id)}`;
+  const lines = body.split("\n");
+  const at = lines.findIndex((l) => l.includes(marker(id)));
+  if (at >= 0) lines[at] = line;
+  else {
+    while (lines.length && lines.at(-1) === "") lines.pop();
+    if (!lines.at(-1)?.startsWith("- ")) lines.push("");
+    lines.push(line);
+  }
+  body = lines.join("\n").replace(/\n*$/, "\n");
+  await fs.writeFile(file, body);
+  await ensureAgentsLink(root);
+}
+
+async function removeMemoryLine(root, id) {
+  const body = await readMemoryFile(root);
+  if (body == null) return;
+  const kept = body.split("\n").filter((l) => !l.includes(marker(id)));
+  await fs.writeFile(path.join(root, MEMORY_FILE), kept.join("\n").replace(/\n*$/, "\n"));
+}
+
+async function ensureAgentsLink(root) {
+  const file = path.join(root, "AGENTS.md");
+  const body = await fs.readFile(file, "utf8").catch(() => null);
+  if (body != null && /\(?\.?\/?memories\.md\)?/i.test(body)) return;
+  const next = body == null ? `${AGENTS_LINK}\n` : `${body.replace(/\n*$/, "\n")}\n${AGENTS_LINK}\n`;
+  await fs.writeFile(file, next);
+}
+
+const MEMORY_SYSTEM = `You read what a person typed to a coding agent and pick out lasting guidance worth adding to the project's agent instructions, so future agents follow it without being told again.
+Return JSON only, no markdown: {"memories": [{"text": string, "kind": "decision" | "preference" | "correction", "quote": string, "describes_current_request": boolean, "lasting": boolean}]}
+
+A memory is a rule for future work: it would still be true and useful a month from now, in a different task in this project.
+- decision: how this project does something. "the source of truth is the approved recording, not the script", "treat clicks as hints for the editing agent, never as destructive edits".
+- preference: what the person likes in results or process. "support light and dark mode", "use the component layout system when showing components".
+- correction: the person pushing back on something the agent did, so it doesn't happen again. Their reaction to the agent's previous reply counts.
+
+Never a memory:
+- A request, feature idea or task description, however detailed ("add a right-click menu to the sidebar", "build a todos panel"). Describing what to build now is not a rule for later.
+- Questions, approvals and nudges ("go", "yes", "please continue", "ELI5"), status reports, thanks.
+- Facts about the current bug or run.
+- Anything in the known list, even reworded. Items marked rejected were turned down: never propose them or close variants.
+
+text: one imperative sentence for a future agent, at most 160 characters. quote: the person's own words, verbatim, at most 120 characters. describes_current_request: true when the text restates what the person is asking the agent to build, change or do in this request (a feature, its behavior, its files). Those are dropped: a spec for the thing being built is not a rule for future work, even when it says "always" or describes how the feature should behave. lasting: false if it only matters for the current task; those are dropped too.
+Most messages contain no memory. An empty list is the usual answer. At most 2.`;
+
+async function proposeMemories({ messages, known }) {
+  const prompt = `Known memories:\n${JSON.stringify(known)}\n\nNew messages (the agent's previous reply, then what the person typed):\n${JSON.stringify(messages)}\n\nReturn the JSON now.`;
+  const r = await run(
+    "pi",
+    ["-p", "--no-session", "-ne", "-nt", "-ns", "-np", "-nc", "--no-mcp", "--no-themes", "--thinking", "off", "--model", model, "--system-prompt", MEMORY_SYSTEM],
+    { input: prompt, timeout: 90_000, env: { ...process.env, PI_NO_TITLE: "1" } },
+  );
+  if (r.code !== 0) throw new Error((r.stderr.trim().split("\n").pop() || `pi exited ${r.code}`).slice(0, 200));
+  const cleaned = r.stdout.replace(/```(?:json)?/g, "");
+  const a = cleaned.indexOf("{");
+  const b = cleaned.lastIndexOf("}");
+  if (a < 0 || b <= a) return [];
+  const v = JSON.parse(cleaned.slice(a, b + 1));
+  const KINDS = ["decision", "preference", "correction"];
+  return (Array.isArray(v.memories) ? v.memories : [])
+    .filter((m) => m && typeof m.text === "string" && m.text.trim() && m.lasting !== false && m.describes_current_request !== true)
+    .slice(0, 2)
+    .map((m) => ({ text: m.text.trim().slice(0, 220), kind: KINDS.includes(m.kind) ? m.kind : "preference", quote: String(m.quote ?? "").slice(0, 160) }));
+}
+
+// New prompts in a session since it was last read for memories: each with the reply before it.
+async function extractFrom(session, root) {
+  const st = await fs.stat(session.file).catch(() => null);
+  if (!st) return;
+  const peek = await readStore(root);
+  const seen = peek.processed[session.file];
+  if (seen && seen.size === st.size) return;
+  const conversation = await recentConversation(session.file);
+  // Harness notes arrive as user messages too; they never carry the person's guidance.
+  const users = conversation.filter((m) => m.role === "user" && !INJECTED.some((re) => re.test(m.text)));
+  let fresh;
+  if (!seen) fresh = users.slice(-MAX_NEW_FIRST_SIGHT);
+  else {
+    const at = users.findIndex((m) => m.id === seen.user);
+    fresh = at >= 0 ? users.slice(at + 1) : users.slice(-MAX_NEW_FIRST_SIGHT);
+  }
+  const lastUser = users.at(-1)?.id ?? seen?.user ?? null;
+  let proposed = [];
+  if (fresh.length) {
+    const messages = fresh.map((u) => {
+      const i = conversation.indexOf(u);
+      const before = conversation.slice(0, i).reverse().find((m) => m.role === "assistant");
+      return { agent_before: before ? before.text.slice(-700) : null, person: u.text.slice(0, 1500), id: u.id };
+    });
+    const known = peek.items
+      .filter((m) => m.status !== "removed" || m.updated_at > Date.now() - 30 * 86400_000)
+      .slice(-80)
+      .map((m) => (m.status === "dismissed" || m.status === "removed" ? `rejected: ${m.text}` : m.text));
+    proposed = (await proposeMemories({ messages, known })).map((m) => ({ ...m, from: messages.at(-1).id }));
+  }
+  await withWaitLock(`mem-${root}`, async () => {
+    const store = await readStore(root);
+    const have = new Set(store.items.map((m) => norm(m.text)));
+    for (const m of proposed) {
+      if (have.has(norm(m.text))) continue;
+      store.items.push({
+        id: newId(),
+        text: m.text,
+        kind: m.kind,
+        quote: m.quote,
+        status: "pending",
+        created_at: Date.now(),
+        updated_at: Date.now(),
+        source: { terminal: session.terminal, session: session.name, file: session.file, entry: m.from },
+      });
+      have.add(norm(m.text));
+    }
+    store.processed[session.file] = { size: st.size, user: lastUser };
+    await writeJsonAtomic(memStoreFile(root), store);
+  });
+}
+
+async function memoriesFor(roots) {
+  const out = [];
+  for (const root of roots) {
+    const store = await withWaitLock(`mem-${root}`, async () => {
+      const s = await reconcile(await readStore(root));
+      await writeJsonAtomic(memStoreFile(root), s);
+      return s;
+    });
+    const by = (st) => store.items.filter((m) => m.status === st);
+    out.push({
+      root,
+      name: path.basename(root),
+      file: path.join(root, MEMORY_FILE),
+      pending: by("pending").sort((a, b) => b.created_at - a.created_at),
+      accepted: by("accepted").sort((a, b) => a.updated_at - b.updated_at),
+      dismissed: by("dismissed").length + by("removed").length,
+    });
+  }
+  return out;
+}
+
+async function memoryAction(action, root, id, text) {
+  return withWaitLock(`mem-${root}`, async () => {
+    const store = await readStore(root);
+    let m = store.items.find((x) => x.id === id);
+    if (action === "add") {
+      if (!text?.trim()) fail("INVALID", "--text is required");
+      m = { id: newId(), text: text.trim(), kind: "decision", quote: "", status: "pending", created_at: Date.now(), updated_at: Date.now(), source: { manual: true } };
+      store.items.push(m);
+      action = "accept";
+      text = null;
+    }
+    if (!m) fail("NOT_FOUND", `no memory ${id} for ${root}`);
+    if (text != null && text.trim()) m.text = text.trim().replace(/\s+/g, " ");
+    if (action === "accept") {
+      await writeMemoryLine(root, m.id, m.text);
+      m.status = "accepted";
+    } else if (action === "dismiss") {
+      m.status = "dismissed";
+    } else if (action === "remove") {
+      await removeMemoryLine(root, m.id);
+      m.status = "removed";
+    } else if (action === "restore") {
+      m.status = "pending";
+    } else if (action === "edit") {
+      if (m.status === "accepted") await writeMemoryLine(root, m.id, m.text);
+    } else fail("INVALID", `unknown memory action ${action}`);
+    m.updated_at = Date.now();
+    await writeJsonAtomic(memStoreFile(root), store);
+    return m;
+  });
+}
+
 // ---------- commands ----------
 
 async function withLock(space, fn) {
@@ -519,9 +757,20 @@ async function refresh(space, force) {
       }
     });
 
+    // Project roots, then memory candidates from new prompts (after the task lists, so a slow
+    // model call here never holds those back from the person).
+    index.roots = index.roots ?? {};
+    for (const sess of sessions) sess.root = sess.cwd ? await gitRoot(sess.cwd, index.roots) : null;
+    await pool(sessions.filter((x) => x.file && x.root), MAX_PARALLEL, (sess) =>
+      extractFrom(sess, sess.root).catch((e) => {
+        sess.memory_error = String(e.message || e).slice(0, 200);
+      }),
+    );
+
     // Merge with the index another refresh may have written meanwhile.
     const latest = await readJson(indexFile(), { version: VERSION, files: {} });
     for (const [f, v] of Object.entries(index.files)) if (!latest.files[f] || latest.files[f].offset <= v.offset) latest.files[f] = v;
+    latest.roots = { ...(latest.roots ?? {}), ...index.roots };
     await writeJsonAtomic(indexFile(), latest);
 
     const doc = applyPrefs({ version: VERSION, space, model, updated_at: now, state: sessions.length ? "ready" : "empty", sessions }, await readPrefs(space));
@@ -540,6 +789,8 @@ const DESCRIBE = {
     show: "show --space <id> [--state <dir>]: print the cached task lists without reading sessions or calling a model",
     order: "order --space <id> --terminals t1,t2,...: set the session order, most important first (sessions not listed follow)",
     priority: "priority --space <id> --terminal <t> --task <key> --level high|normal|low: rank one task (keys are in each task's `key`)",
+    memories: "memories --space <id> | --root <folder>: candidate and kept memories for the space's projects (git roots of its Pi sessions)",
+    memory: "memory accept|dismiss|edit|remove|restore --root <folder> --id <id> [--text <words>]; memory add --root <folder> --text <words>: accept writes the line to <root>/memories.md and links it from <root>/AGENTS.md; remove deletes the line",
     describe: "this description",
   },
   output: {
@@ -547,6 +798,7 @@ const DESCRIBE = {
     prefs: "{order: [terminal...], priority: {\"<terminal>|<task key>\": high|low}} chosen by the person",
     sessions: "[{terminal, tab, rank (position in prefs.order or null), status (working|blocked|done|idle|error), name, title, now, tasks: [{text, key, status: in_progress|todo|done|blocked, priority: high|normal|low}], source: board|haiku|none, mapping: label|name|name-newest|cached|newest|none, summarized_at, error}]",
   },
+  memory_output: "{projects: [{root, name, file, pending: [{id, text, kind: decision|preference|correction, quote, source, created_at}], accepted: [...], dismissed: count}]}. Candidates come from new prompts in Pi sessions during refresh; memories.md is the authority for kept ones.",
   state_dir: stateDir,
   model,
 };
@@ -555,6 +807,21 @@ const cmd = args._[0];
 try {
   if (cmd === "describe") {
     process.stdout.write(JSON.stringify(DESCRIBE, null, 1) + "\n");
+  } else if (cmd === "memories") {
+    let roots;
+    if (typeof args.root === "string") roots = [path.resolve(expandHome(args.root))];
+    else if (typeof args.space === "string") {
+      const doc = await readJson(spaceFile(args.space), null);
+      roots = [...new Set((doc?.sessions ?? []).map((x) => x.root).filter(Boolean))];
+    } else fail("INVALID", "--space <id> or --root <folder> is required");
+    process.stdout.write(JSON.stringify({ space: args.space ?? null, projects: await memoriesFor(roots) }) + "\n");
+  } else if (cmd === "memory") {
+    const action = args._[1];
+    if (typeof args.root !== "string") fail("INVALID", "--root <project folder> is required");
+    if (action !== "add" && typeof args.id !== "string") fail("INVALID", "--id is required");
+    const root = path.resolve(expandHome(args.root));
+    const m = await memoryAction(action, root, args.id, typeof args.text === "string" ? args.text : null);
+    process.stdout.write(JSON.stringify({ root, memory: m }) + "\n");
   } else if (cmd === "order" || cmd === "priority") {
     if (typeof args.space !== "string") fail("INVALID", "--space <id> is required");
     const prefs = await readPrefs(args.space);

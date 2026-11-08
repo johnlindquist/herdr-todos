@@ -1,7 +1,11 @@
-# Todos for Herdr
+# Todos and Memories for Herdr
 
-A right-hand sidebar for the Herdr desktop app. It lists the task lists of the Pi sessions in the
-space you're looking at and updates them by itself.
+A right-hand sidebar for the Herdr desktop app, in two halves:
+
+- **Todos** (top): the task lists of the Pi sessions in the space you're looking at, kept up to date.
+- **Memories** (bottom): rules worth keeping that you stated in your own prompts. Keep one and it
+  goes into the project's `memories.md`, which `AGENTS.md` links to; dismiss it and it isn't
+  suggested again.
 
 - **Sessions with a `todo` board** (the `todo` tool from herdr-pi-todos) show that board exactly.
 - **Other sessions** are summarized by Haiku (`anthropic/claude-haiku-4-5` through `pi -p`) each
@@ -24,14 +28,39 @@ space you're looking at and updates them by itself.
   so the flag stays attached.
 - The refresh button (top right) re-reads the space and asks Haiku again for every session.
 
+## Memories
+
+While Todos updates, each session's new prompts (and the reply each one reacts to) go to Haiku with
+one question: did the person state a rule for future work here? A decision ("the approved
+recording is the source of truth"), a preference ("support light and dark mode") or a correction of
+the agent. Feature requests and task descriptions are dropped, and most prompts produce nothing.
+A session seen for the first time contributes only its latest two prompts.
+
+- **Keep** writes the line to `<project>/memories.md` (the session's git root) and, the first time,
+  adds a line to `<project>/AGENTS.md` linking to it. AGENTS.md is created if the project has none.
+- **Edit** changes the wording; **Keep** in the editor keeps the edited version.
+- **Dismiss** hides it and tells future suggestions not to propose it again. **Undo** brings it back.
+- **Kept in memories.md** lists what's kept; ✕ removes the line from the file.
+- `memories.md` is the authority: delete a line by hand and it no longer counts as kept.
+
+Each line carries a hidden marker (`<!-- memory:id -->`) so removing and editing touch only that
+line. Sessions outside a git repository and spaces on other machines don't produce suggestions.
+
 ## Install
 
 ```sh
-./install.sh        # copies into ~/.config/herdr-app/mods/todos and checks it
+./install.sh        # copies both mods into ~/.config/herdr-app/mods and checks them
 ./dev-reload.sh     # same, then restarts the shown copy (when hot reload misses a change)
 ```
 
-The first install docks the sidebar on the right of the layout you're using.
+The first install docks Todos on the right of the layout you're using. Memories has no dock spot
+of its own; put it under Todos with a column in the layout:
+
+```json
+{ "id": "right-panel", "type": "column", "size": { "px": 304 }, "children": [
+  { "type": "block", "content": { "mod": "todos" }, "size": { "weight": 3 } },
+  { "id": "memories", "type": "block", "content": { "mod": "memories" }, "size": { "weight": 2 } } ] }
+```
 
 ## For agents
 
@@ -43,6 +72,9 @@ node todos.mjs show     --space <id> --state ~/.cache/herdr-todos/default
 node todos.mjs refresh  --space <id> --state ~/.cache/herdr-todos/default [--force]
 node todos.mjs order    --space <id> --state ... --terminals t8r,t90
 node todos.mjs priority --space <id> --state ... --terminal t8r --task '#2' --level high
+node todos.mjs memories --space <id> --state ...            # or --root <project folder>
+node todos.mjs memory accept|dismiss|edit|remove|restore --root <folder> --id <id> [--text <words>] --state ...
+node todos.mjs memory add --root <folder> --text "<rule>" --state ...
 ```
 
 Space ids come from `herdr-app status` or `hc get <terminal>` (label `herdr.space`). Task keys
@@ -63,4 +95,5 @@ listed. Pi terminals whose Pi has exited drop out after the next update.
 
 ## Cost
 
-One Haiku call per changed session, about 4–6k input tokens. Unchanged sessions are never sent.
+One Haiku call per changed session for its tasks (about 4–6k input tokens), and one per batch of new
+prompts for memories (usually under 2k). Unchanged sessions are never sent.
