@@ -3,9 +3,9 @@
 A right-hand sidebar for the Herdr desktop app, in two halves:
 
 - **Todos** (top): the task lists of the Pi sessions in the space you're looking at, kept up to date.
-- **Memories** (bottom): rules worth keeping that you stated in your own prompts. Keep one and it
-  goes into the project's `memories.md`, which `AGENTS.md` links to; dismiss it and it isn't
-  suggested again.
+- **Memories** (bottom): rules worth keeping that you stated in your own prompts. Keep one and the
+  project's `MEMORIES.md` (linked from `AGENTS.md`) is rewritten to include it; dismiss it and it
+  isn't suggested again.
 
 - **Sessions with a `todo` board** (the `todo` tool from herdr-pi-todos) show that board exactly.
 - **Other sessions** are summarized by Haiku (`anthropic/claude-haiku-4-5` through `pi -p`) each
@@ -39,15 +39,22 @@ recording is the source of truth"), a preference ("support light and dark mode")
 the agent. Feature requests and task descriptions are dropped, and most prompts produce nothing.
 A session seen for the first time contributes only its latest two prompts.
 
-- **Keep** writes the line to `<project>/memories.md` (the session's git root) and, the first time,
-  adds a line to `<project>/AGENTS.md` linking to it. AGENTS.md is created if the project has none.
-- **Edit** changes the wording; **Keep** in the editor keeps the edited version.
-- **Dismiss** hides it and tells future suggestions not to propose it again. **Undo** brings it back.
-- **Kept in memories.md** lists what's kept; ✕ removes the line from the file.
-- `memories.md` is the authority: delete a line by hand and it no longer counts as kept.
+- **Keep**, **Edit** (in the editor, Keep saves your wording) and removing a kept line each
+  rewrite `<project>/MEMORIES.md` from all kept memories: overlapping ones merge, related ones
+  group under short headings (only when there are several), and each line becomes
+  `- **Label:** rule` in as few words as keep its meaning. Sonnet (`anthropic/claude-sonnet-5-5`,
+  override with `HERDR_TODOS_COMPOSE_MODEL`) does the rewrite; code checks that every kept memory
+  is still in the file before writing it, and falls back to Haiku, then to the plain list.
+- The first Keep adds one line to `<project>/AGENTS.md`:
+  `Read [MEMORIES.md](MEMORIES.md) first: standing decisions for this project.` AGENTS.md is created
+  if the project has none. An older `memories.md` is renamed and its link updated.
+- **Dismiss** hides a suggestion and tells future suggestions not to propose it again. **Undo**
+  brings it back.
+- **Kept in MEMORIES.md** lists the file's lines; ✕ removes a line (all memories merged into it).
+- Hand edits to MEMORIES.md are kept: a deleted line removes its memories, a new line becomes a
+  kept memory, and both show in the next rewrite.
 
-Each line carries a hidden marker (`<!-- memory:id -->`) so removing and editing touch only that
-line. Sessions outside a git repository don't produce suggestions.
+Sessions outside a git repository don't produce suggestions.
 
 ## Install
 

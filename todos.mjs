@@ -16,6 +16,9 @@ import path from "node:path";
 
 const VERSION = 1;
 const DEFAULT_MODEL = "anthropic/claude-haiku-4-5";
+// Rewriting MEMORIES.md happens only when a memory is kept, edited or removed, and its wording is
+// read by every future agent: worth a stronger model. Falls back to the summary model.
+const DEFAULT_COMPOSE_MODEL = "anthropic/claude-sonnet-5-5";
 const WORKING_RESUMMARY_MS = 120_000; // a session still working is summarized at most this often
 const RECENT_FILE_DAYS = 21;
 const MAX_FILES_PER_DIR = 80;
@@ -42,6 +45,7 @@ function parseArgs(argv) {
 const args = parseArgs(process.argv.slice(2));
 const stateDir = path.resolve(expandHome(typeof args.state === "string" ? args.state : "~/.cache/herdr-todos"));
 const model = typeof args.model === "string" ? args.model : process.env.HERDR_TODOS_MODEL || DEFAULT_MODEL;
+const composeModel = process.env.HERDR_TODOS_COMPOSE_MODEL || DEFAULT_COMPOSE_MODEL;
 const piAgentDir = expandHome(process.env.PI_CODING_AGENT_DIR || "~/.pi/agent");
 
 function expandHome(p) {
@@ -482,15 +486,17 @@ function boardTasks(board) {
 
 // ---------- memories ----------
 // Candidate guidance from the person's own messages, kept per project (git root) until the person
-// keeps or dismisses it. Kept ones live in <root>/memories.md, one line each, marked with an id;
-// <root>/AGENTS.md links to that file.
+// keeps or dismisses it. Kept ones are rewritten together into <root>/MEMORIES.md whenever one is
+// added, removed or edited: merged, grouped and as terse as their meaning allows. The store keeps
+// which memories each line came from; <root>/AGENTS.md links to the file.
 
-const MEMORY_FILE = "memories.md";
-const MEMORY_HEADER = `# Memories
-
-Decisions and preferences from earlier work in this project. Follow them unless the current request says otherwise.
-`;
-const AGENTS_LINK = `Read [memories.md](memories.md) before you start: decisions and preferences from earlier work in this project. Follow them unless the current request says otherwise.`;
+const MEMORY_FILE = "MEMORIES.md";
+const LEGACY_FILE = "memories.md";
+const MEMORY_HEADER = "# Memories\n\nStanding decisions for this project. A request can override them.\n";
+const AGENTS_LINK = "Read [MEMORIES.md](MEMORIES.md) first: standing decisions for this project.";
+const LEGACY_LINKS = [
+  "Read [memories.md](memories.md) before you start: decisions and preferences from earlier work in this project. Follow them unless the current request says otherwise.",
+];
 const MAX_NEW_FIRST_SIGHT = 2; // a session seen for the first time: only its latest prompts
 const INJECTED = [
   /^The conversation history above was just compacted/,
@@ -505,7 +511,12 @@ const INJECTED = [
 const memStoreFile = (root) => path.join(stateDir, "memories", `${root.replace(/[^A-Za-z0-9_-]/g, "_")}.json`);
 const norm = (t) => t.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
 const newId = () => Math.random().toString(36).slice(2, 10);
-const marker = (id) => `<!-- memory:${id} -->`;
+const marker = (id) => `<!-- memory:${id} -->`; // the first format: one marked line per memory
+const hash = (t) => {
+  let h = 0;
+  for (let i = 0; i < t.length; i++) h = (Math.imul(h, 31) + t.charCodeAt(i)) | 0;
+  return String(h >>> 0);
+};
 
 async function gitRoot(cwd, cache) {
   if (cache[cwd] !== undefined) return cache[cwd];
@@ -534,48 +545,137 @@ async function readMemoryFile(root) {
   return fs.readFile(path.join(root, MEMORY_FILE), "utf8").catch(() => null);
 }
 
-// The file is the authority for what is kept: a kept line someone deleted by hand is no longer kept.
-async function reconcile(store) {
-  const text = await readMemoryFile(store.root);
-  for (const m of store.items) {
-    if (m.status === "accepted" && !(text ?? "").includes(marker(m.id))) {
-      m.status = "removed";
-      m.updated_at = Date.now();
-    }
+// memories.md -> MEMORIES.md (also on case-insensitive disks, where both names are one file).
+async function migrateName(root) {
+  const names = await fs.readdir(root).catch(() => []);
+  if (names.includes(LEGACY_FILE) && !names.includes(MEMORY_FILE)) {
+    const tmp = path.join(root, `.MEMORIES.md.${process.pid}`);
+    await fs.rename(path.join(root, LEGACY_FILE), tmp);
+    await fs.rename(tmp, path.join(root, MEMORY_FILE));
   }
-  return store;
-}
-
-async function writeMemoryLine(root, id, text) {
-  const file = path.join(root, MEMORY_FILE);
-  let body = (await readMemoryFile(root)) ?? MEMORY_HEADER;
-  const line = `- ${text.replace(/\s+/g, " ").trim()} ${marker(id)}`;
-  const lines = body.split("\n");
-  const at = lines.findIndex((l) => l.includes(marker(id)));
-  if (at >= 0) lines[at] = line;
-  else {
-    while (lines.length && lines.at(-1) === "") lines.pop();
-    if (!lines.at(-1)?.startsWith("- ")) lines.push("");
-    lines.push(line);
+  const agents = path.join(root, "AGENTS.md");
+  const body = await fs.readFile(agents, "utf8").catch(() => null);
+  if (body != null) {
+    let next = body;
+    for (const old of LEGACY_LINKS) next = next.split(old).join(AGENTS_LINK);
+    // Two old links (one per earlier writer) become one.
+    const twice = `${AGENTS_LINK}\n\n${AGENTS_LINK}`;
+    while (next.includes(twice)) next = next.replace(twice, AGENTS_LINK);
+    if (next !== body) await fs.writeFile(agents, next);
   }
-  body = lines.join("\n").replace(/\n*$/, "\n");
-  await fs.writeFile(file, body);
-  await ensureAgentsLink(root);
-}
-
-async function removeMemoryLine(root, id) {
-  const body = await readMemoryFile(root);
-  if (body == null) return;
-  const kept = body.split("\n").filter((l) => !l.includes(marker(id)));
-  await fs.writeFile(path.join(root, MEMORY_FILE), kept.join("\n").replace(/\n*$/, "\n"));
 }
 
 async function ensureAgentsLink(root) {
   const file = path.join(root, "AGENTS.md");
   const body = await fs.readFile(file, "utf8").catch(() => null);
-  if (body != null && /\(?\.?\/?memories\.md\)?/i.test(body)) return;
+  if (body != null && /MEMORIES\.md/.test(body)) return;
   const next = body == null ? `${AGENTS_LINK}\n` : `${body.replace(/\n*$/, "\n")}\n${AGENTS_LINK}\n`;
   await fs.writeFile(file, next);
+}
+
+const bullet = (it) => `- ${it.label ? `**${it.label}:** ` : ""}${it.text}`;
+
+function renderFile(sections) {
+  const parts = [MEMORY_HEADER];
+  const headed = sections.length > 1;
+  for (const sec of sections) {
+    if (!sec.items.length) continue;
+    parts.push(`${headed ? `## ${sec.heading}\n\n` : ""}${sec.items.map(bullet).join("\n")}\n`);
+  }
+  return parts.join("\n");
+}
+
+// Brings the store up to date with the file: the first format's markers, or edits made by hand
+// since the last rewrite (a deleted line removes its memories; a new line is a kept memory).
+// Returns true when the file needs rewriting.
+async function importFile(store) {
+  await migrateName(store.root);
+  const text = await readMemoryFile(store.root);
+  const accepted = store.items.filter((m) => m.status === "accepted");
+  const now = Date.now();
+  if (!store.rendered) {
+    if (text == null) return accepted.length > 0;
+    for (const m of accepted) if (!text.includes(marker(m.id))) Object.assign(m, { status: "removed", updated_at: now });
+    return true; // first format: rewrite in the new one
+  }
+  if (text == null) {
+    for (const m of accepted) Object.assign(m, { status: "removed", updated_at: now });
+    return false;
+  }
+  if (hash(text) === store.rendered.hash) return false;
+  const lines = new Set(text.split("\n").map((l) => l.trim()).filter((l) => l.startsWith("- ")));
+  const known = new Set();
+  for (const it of store.rendered.items) {
+    const line = bullet(it);
+    known.add(line);
+    if (!lines.has(line)) for (const id of it.ids) {
+      const m = store.items.find((x) => x.id === id && x.status === "accepted");
+      if (m) Object.assign(m, { status: "removed", updated_at: now });
+    }
+  }
+  for (const line of lines) {
+    if (known.has(line)) continue;
+    const words = line.slice(2).replace(/<!--.*?-->/g, "").trim();
+    if (!words) continue;
+    store.items.push({ id: newId(), text: words.replace(/\*\*/g, ""), kind: "decision", quote: "", status: "accepted", created_at: now, updated_at: now, source: { manual: true } });
+  }
+  return true;
+}
+
+const COMPOSE_SYSTEM = `You maintain MEMORIES.md: a project's standing rules for coding agents, read at the start of every task. Every word costs attention, so rewrite the kept memories into the smallest form that keeps their full meaning.
+Return JSON only, no markdown: {"sections": [{"heading": string, "items": [{"label": string, "text": string, "ids": [string]}]}]}
+- Merge memories that overlap or serve one goal into one item and list all their ids. Every given id appears exactly once.
+- label: 1-3 words in sentence case naming the subject ("Icons", "Source of truth").
+- text: the rule, imperative, at most 80 characters. Cut filler ("make sure to", "when possible", "in order to"), reasons, and words the label already says. Keep concrete specifics: names, tools, numbers, paths. Semicolons over sentences.
+- Example. Memories: "Use VS Code Codicons (already shipped in Herdr) for icons; no font installation needed." and "Use existing open source icon libraries and fonts instead of designing custom icons." Item: {"label": "Icons", "text": "Codicons (ships with Herdr) or other open source sets; never draw custom icons"}.
+- Group by topic under 1-2 word headings, most important first. Every section needs at least 2 items: fold a lone item into the closest section. With 5 rules or fewer, use a single section.
+- Keep earlier headings, labels and wording when they still fit, so the file changes as little as possible.`;
+
+// Rewrites MEMORIES.md from every kept memory. A model groups, merges and tightens the wording;
+// code checks that every memory is still there and renders the file.
+async function compose(store) {
+  const accepted = store.items.filter((m) => m.status === "accepted");
+  const ids = new Set(accepted.map((m) => m.id));
+  let sections = null;
+  if (accepted.length) {
+    for (const m of [...new Set([composeModel, model])]) try {
+      const payload = {
+        previous: store.rendered?.sections ?? null,
+        memories: accepted.map((m) => ({ id: m.id, text: m.text, kind: m.kind })),
+      };
+      const r = await run(
+        "pi",
+        ["-p", "--no-session", "-ne", "-nt", "-ns", "-np", "-nc", "--no-mcp", "--no-themes", "--thinking", "off", "--model", m, "--system-prompt", COMPOSE_SYSTEM],
+        { input: `${JSON.stringify(payload)}
+
+Return the JSON now.`, timeout: 90_000, env: { ...process.env, PI_NO_TITLE: "1" } },
+      );
+      const cleaned = r.stdout.replace(/```(?:json)?/g, "");
+      const v = JSON.parse(cleaned.slice(cleaned.indexOf("{"), cleaned.lastIndexOf("}") + 1));
+      const used = new Set();
+      sections = (v.sections ?? []).map((sec) => ({
+        heading: String(sec.heading ?? "").trim().slice(0, 40) || "Rules",
+        items: (sec.items ?? [])
+          .map((it) => ({
+            label: String(it.label ?? "").replace(/[*:]+/g, "").trim().slice(0, 40) || null,
+            text: String(it.text ?? "").replace(/\s+/g, " ").trim().slice(0, 240),
+            ids: (Array.isArray(it.ids) ? it.ids : []).filter((id) => ids.has(id) && !used.has(id) && used.add(id)),
+          }))
+          .filter((it) => it.text && it.ids.length),
+      })).filter((sec) => sec.items.length);
+      // Anything the model dropped goes back in as written.
+      const missing = accepted.filter((m) => !used.has(m.id));
+      if (missing.length) sections.push({ heading: "Other", items: missing.map((m) => ({ label: null, text: m.text, ids: [m.id] })) });
+      if (sections.length) break;
+    } catch {
+      sections = null;
+    }
+    if (!sections?.length) sections = [{ heading: "Rules", items: accepted.map((m) => ({ label: null, text: m.text, ids: [m.id] })) }];
+  } else sections = [];
+  const text = renderFile(sections);
+  await fs.writeFile(path.join(store.root, MEMORY_FILE), text);
+  if (accepted.length) await ensureAgentsLink(store.root);
+  store.rendered = { sections, items: sections.flatMap((s) => s.items), hash: hash(text), at: Date.now() };
 }
 
 const MEMORY_SYSTEM = `You read what a person typed to a coding agent and pick out lasting guidance worth adding to the project's agent instructions, so future agents follow it without being told again.
@@ -671,7 +771,8 @@ async function memoriesFor(roots) {
   const out = [];
   for (const root of roots) {
     const store = await withWaitLock(`mem-${root}`, async () => {
-      const s = await reconcile(await readStore(root));
+      const s = await readStore(root);
+      if (await importFile(s)) await compose(s);
       await writeJsonAtomic(memStoreFile(root), s);
       return s;
     });
@@ -681,6 +782,8 @@ async function memoriesFor(roots) {
       name: path.basename(root),
       file: path.join(root, MEMORY_FILE),
       pending: by("pending").sort((a, b) => b.created_at - a.created_at),
+      // What MEMORIES.md says, line by line, with the memories behind each line.
+      kept: (store.rendered?.sections ?? []).map((sec) => ({ heading: sec.heading, items: sec.items })),
       accepted: by("accepted").sort((a, b) => a.updated_at - b.updated_at),
       dismissed: by("dismissed").length + by("removed").length,
     });
@@ -688,35 +791,40 @@ async function memoriesFor(roots) {
   return out;
 }
 
-async function memoryAction(action, root, id, text) {
+// accept, dismiss, remove, restore and edit take one id or several ("a,b": a merged line).
+// Every change to what is kept rewrites MEMORIES.md.
+async function memoryAction(action, root, idArg, text) {
   return withWaitLock(`mem-${root}`, async () => {
     const store = await readStore(root);
-    let m = store.items.find((x) => x.id === id);
+    await importFile(store);
+    let targets;
     if (action === "add") {
       if (!text?.trim()) fail("INVALID", "--text is required");
-      m = { id: newId(), text: text.trim(), kind: "decision", quote: "", status: "pending", created_at: Date.now(), updated_at: Date.now(), source: { manual: true } };
+      const m = { id: newId(), text: text.trim(), kind: "decision", quote: "", status: "pending", created_at: Date.now(), updated_at: Date.now(), source: { manual: true } };
       store.items.push(m);
+      targets = [m];
       action = "accept";
       text = null;
+    } else {
+      const ids = String(idArg).split(",").map((x) => x.trim()).filter(Boolean);
+      targets = ids.map((id) => store.items.find((x) => x.id === id));
+      if (!targets.length || targets.some((m) => !m)) fail("NOT_FOUND", `no memory ${idArg} for ${root}`);
     }
-    if (!m) fail("NOT_FOUND", `no memory ${id} for ${root}`);
-    if (text != null && text.trim()) m.text = text.trim().replace(/\s+/g, " ");
-    if (action === "accept") {
-      await writeMemoryLine(root, m.id, m.text);
-      m.status = "accepted";
-    } else if (action === "dismiss") {
-      m.status = "dismissed";
-    } else if (action === "remove") {
-      await removeMemoryLine(root, m.id);
-      m.status = "removed";
-    } else if (action === "restore") {
-      m.status = "pending";
-    } else if (action === "edit") {
-      if (m.status === "accepted") await writeMemoryLine(root, m.id, m.text);
-    } else fail("INVALID", `unknown memory action ${action}`);
-    m.updated_at = Date.now();
+    const keptBefore = targets.some((m) => m.status === "accepted");
+    if (text != null && text.trim()) {
+      // Editing a merged line: the first memory takes the new words, the rest fold into it.
+      targets[0].text = text.trim().replace(/\s+/g, " ");
+      if (keptBefore && targets.length > 1) for (const m of targets.slice(1)) m.status = "removed";
+    }
+    const STATUS = { accept: "accepted", dismiss: "dismissed", remove: "removed", restore: "pending" };
+    if (action !== "edit") {
+      if (!STATUS[action]) fail("INVALID", `unknown memory action ${action}`);
+      for (const m of targets) m.status = STATUS[action];
+    }
+    for (const m of targets) m.updated_at = Date.now();
+    if (keptBefore || action === "accept") await compose(store);
     await writeJsonAtomic(memStoreFile(root), store);
-    return m;
+    return targets.length === 1 ? targets[0] : targets;
   });
 }
 
@@ -838,7 +946,7 @@ const DESCRIBE = {
     order: "order --space <id> --terminals t1,t2,...: set the session order, most important first (sessions not listed follow)",
     priority: "priority --space <id> --terminal <t> --task <key> --level high|normal|low: rank one task (keys are in each task's `key`)",
     memories: "memories --space <id> | --root <folder>: candidate and kept memories for the space's projects (git roots of its Pi sessions)",
-    memory: "memory accept|dismiss|edit|remove|restore --root <folder> --id <id> [--text <words>]; memory add --root <folder> --text <words>: accept writes the line to <root>/memories.md and links it from <root>/AGENTS.md; remove deletes the line",
+    memory: "memory accept|dismiss|edit|remove|restore --root <folder> --id <id> [--text <words>]; memory add --root <folder> --text <words>: accept rewrites <root>/MEMORIES.md (merged, grouped, terse) and links it from <root>/AGENTS.md; --id takes several ids (a,b) for a merged line",
     describe: "this description",
   },
   output: {
@@ -846,7 +954,7 @@ const DESCRIBE = {
     prefs: "{order: [terminal...], priority: {\"<terminal>|<task key>\": high|low}} chosen by the person",
     sessions: "[{terminal, tab, rank (position in prefs.order or null), status (working|blocked|done|idle|error), name, title, now, tasks: [{text, key, status: in_progress|todo|done|blocked, priority: high|normal|low}], source: board|haiku|none, mapping: label|name|name-newest|cached|newest|none, summarized_at, error}]",
   },
-  memory_output: "{projects: [{root, name, file, pending: [{id, text, kind: decision|preference|correction, quote, source, created_at}], accepted: [...], dismissed: count}]}. Candidates come from new prompts in Pi sessions during refresh; memories.md is the authority for kept ones.",
+  memory_output: "{projects: [{root, name, file, pending: [{id, text, kind: decision|preference|correction, quote, source, created_at}], accepted: [...], dismissed: count}]}. Candidates come from new prompts in Pi sessions during refresh; MEMORIES.md edits by hand are kept: a deleted line removes its memories, a new line becomes one.",
   state_dir: stateDir,
   model,
 };
