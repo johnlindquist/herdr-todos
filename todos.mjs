@@ -83,6 +83,32 @@ function run(cmd, argv, { input, timeout = 30_000, env } = {}) {
   });
 }
 
+// Every model call goes through here. Default: Pi in print mode with no tools, extensions or
+// context files. HERDR_TODOS_MODEL_CMD (a JSON argv array) replaces Pi with another command: it
+// gets {"model", "system", "input"} as JSON on stdin and prints the model's reply on stdout.
+async function callModel({ model: m, system, input, timeout = 90_000 }) {
+  const custom = process.env.HERDR_TODOS_MODEL_CMD;
+  let r;
+  if (custom) {
+    let argv;
+    try {
+      argv = JSON.parse(custom);
+    } catch {
+      argv = null;
+    }
+    if (!Array.isArray(argv) || !argv.length || argv.some((x) => typeof x !== "string")) throw new Error("HERDR_TODOS_MODEL_CMD must be a JSON array of strings");
+    r = await run(argv[0], argv.slice(1), { input: JSON.stringify({ model: m, system, input }), timeout });
+  } else {
+    r = await run(
+      "pi",
+      ["-p", "--no-session", "-ne", "-nt", "-ns", "-np", "-nc", "--no-mcp", "--no-themes", "--thinking", "off", "--model", m, "--system-prompt", system],
+      { input, timeout, env: { ...process.env, PI_NO_TITLE: "1" } },
+    );
+  }
+  if (r.code !== 0) throw new Error((r.stderr.trim().split("\n").pop() || `model command exited ${r.code}`).slice(0, 200));
+  return r.stdout;
+}
+
 async function hcJson(argv) {
   const r = await run("hc", [...argv, "--json"], { timeout: 15_000 });
   if (r.code !== 0) throw new Error(`hc ${argv.join(" ")} failed: ${r.stderr.trim() || r.code}`);
@@ -217,7 +243,6 @@ async function scanFile(file, stat, prev) {
         continue;
       }
       for (const line of data.subarray(0, lastNl).toString("utf8").split("\n")) scanLine(entry, line);
-      entry.offset += lastNl + 1 - (data.length - buf.length - (carry === data ? 0 : 0)) + (data.length - buf.length);
       entry.offset = pos - (data.length - lastNl - 1);
       carry = data.subarray(lastNl + 1);
     }
@@ -464,13 +489,7 @@ async function summarize({ status, name, cwd, first, conversation, previous }) {
     conversation,
   };
   const prompt = `Session data:\n${JSON.stringify(payload)}\n\nReturn the JSON task list now.`;
-  const r = await run(
-    "pi",
-    ["-p", "--no-session", "-ne", "-nt", "-ns", "-np", "-nc", "--no-mcp", "--no-themes", "--thinking", "off", "--model", model, "--system-prompt", SYSTEM],
-    { input: prompt, timeout: 90_000, env: { ...process.env, PI_NO_TITLE: "1" } },
-  );
-  if (r.code !== 0) throw new Error((r.stderr.trim().split("\n").pop() || `pi exited ${r.code}`).slice(0, 200));
-  return parseModelJson(r.stdout);
+  return parseModelJson(await callModel({ model, system: SYSTEM, input: prompt }));
 }
 
 function boardTasks(board) {
@@ -643,14 +662,8 @@ async function compose(store) {
         previous: store.rendered?.sections ?? null,
         memories: accepted.map((m) => ({ id: m.id, text: m.text, kind: m.kind })),
       };
-      const r = await run(
-        "pi",
-        ["-p", "--no-session", "-ne", "-nt", "-ns", "-np", "-nc", "--no-mcp", "--no-themes", "--thinking", "off", "--model", m, "--system-prompt", COMPOSE_SYSTEM],
-        { input: `${JSON.stringify(payload)}
-
-Return the JSON now.`, timeout: 90_000, env: { ...process.env, PI_NO_TITLE: "1" } },
-      );
-      const cleaned = r.stdout.replace(/```(?:json)?/g, "");
+      const reply = await callModel({ model: m, system: COMPOSE_SYSTEM, input: `${JSON.stringify(payload)}\n\nReturn the JSON now.` });
+      const cleaned = reply.replace(/```(?:json)?/g, "");
       const v = JSON.parse(cleaned.slice(cleaned.indexOf("{"), cleaned.lastIndexOf("}") + 1));
       const used = new Set();
       sections = (v.sections ?? []).map((sec) => ({
@@ -697,13 +710,8 @@ Most messages contain no memory. An empty list is the usual answer. At most 2.`;
 
 async function proposeMemories({ messages, known }) {
   const prompt = `Known memories:\n${JSON.stringify(known)}\n\nNew messages (the agent's previous reply, then what the person typed):\n${JSON.stringify(messages)}\n\nReturn the JSON now.`;
-  const r = await run(
-    "pi",
-    ["-p", "--no-session", "-ne", "-nt", "-ns", "-np", "-nc", "--no-mcp", "--no-themes", "--thinking", "off", "--model", model, "--system-prompt", MEMORY_SYSTEM],
-    { input: prompt, timeout: 90_000, env: { ...process.env, PI_NO_TITLE: "1" } },
-  );
-  if (r.code !== 0) throw new Error((r.stderr.trim().split("\n").pop() || `pi exited ${r.code}`).slice(0, 200));
-  const cleaned = r.stdout.replace(/```(?:json)?/g, "");
+  const reply = await callModel({ model, system: MEMORY_SYSTEM, input: prompt });
+  const cleaned = reply.replace(/```(?:json)?/g, "");
   const a = cleaned.indexOf("{");
   const b = cleaned.lastIndexOf("}");
   if (a < 0 || b <= a) return [];
@@ -954,9 +962,16 @@ const DESCRIBE = {
     prefs: "{order: [terminal...], priority: {\"<terminal>|<task key>\": high|low}} chosen by the person",
     sessions: "[{terminal, tab, rank (position in prefs.order or null), status (working|blocked|done|idle|error), name, title, now, tasks: [{text, key, status: in_progress|todo|done|blocked, priority: high|normal|low}], source: board|haiku|none, mapping: label|name|name-newest|cached|newest|none, summarized_at, error}]",
   },
-  memory_output: "{projects: [{root, name, file, pending: [{id, text, kind: decision|preference|correction, quote, source, created_at}], accepted: [...], dismissed: count}]}. Candidates come from new prompts in Pi sessions during refresh; MEMORIES.md edits by hand are kept: a deleted line removes its memories, a new line becomes one.",
+  memory_output: "{projects: [{root, name, file, pending: [{id, text, kind: decision|preference|correction, quote, source, created_at}], kept: [{heading, items: [{label, text, ids}]}] (MEMORIES.md as written), accepted: [...], dismissed: count}]}. Candidates come from new prompts in Pi sessions during refresh; MEMORIES.md edits by hand are kept: a deleted line removes its memories, a new line becomes one.",
   state_dir: stateDir,
   model,
+  compose_model: composeModel,
+  environment: {
+    HERDR_TODOS_MODEL: "model for task lists and memory suggestions (default anthropic/claude-haiku-4-5)",
+    HERDR_TODOS_COMPOSE_MODEL: "model that rewrites MEMORIES.md (default anthropic/claude-sonnet-5-5; falls back to HERDR_TODOS_MODEL)",
+    HERDR_TODOS_MODEL_CMD: 'JSON argv array run instead of Pi for every model call; gets {"model","system","input"} as JSON on stdin, prints the reply',
+  },
+  model_cmd: process.env.HERDR_TODOS_MODEL_CMD ?? null,
 };
 
 const cmd = args._[0];

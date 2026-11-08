@@ -106,6 +106,14 @@ sessions) or `missing` (never read); `busy: true` means another refresh holds th
 `mapping` in the output says which one was used. Sub-agents (terminals with a parent) aren't
 listed. Pi terminals whose Pi has exited drop out after the next update.
 
+## Models
+
+- `HERDR_TODOS_MODEL`: task lists and memory suggestions (default `anthropic/claude-haiku-4-5`).
+- `HERDR_TODOS_COMPOSE_MODEL`: the MEMORIES.md rewrite (default `anthropic/claude-sonnet-5-5`).
+- `HERDR_TODOS_MODEL_CMD`: a JSON array such as `["node","my-model.mjs"]`, run instead of Pi for
+  every model call. It gets `{"model","system","input"}` as JSON on stdin and prints the reply.
+  Use it to try other providers, or a recorded or test model.
+
 ## Cost
 
 One Haiku call per changed session for its tasks (about 4–6k input tokens), and one per batch of new
