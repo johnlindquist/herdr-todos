@@ -5,7 +5,7 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { agents, spaces, focused, panes, exec, home, appHome, run, theme, readTextFile, nextCommand, shared, setShared } from "herdr";
+import { agents, spaces, focused, panes, exec, home, appHome, run, theme, readTextFile, nextCommand, shared, setShared, openOverlay } from "herdr";
 
 const NAME = "todos";
 const ICON = (n) => `mods/${NAME}/icons/${n}.svg`;
@@ -86,6 +86,30 @@ function showPane(pane) {
   if (siblings > 1 && !target.zoomed && (zoomedNow || zoomedThere)) run("pane.zoom", { pane });
 }
 
+// The right-click menu (mods/todos-menu): items are { label, icon, action, args, sep? }; the
+// choice comes back as the "menu" command with shared "todos.menu" = { action, args, at }.
+const CHROME = (n) => `mods/workspace-chrome/${n}.svg`;
+function openMenu(owner, title, items) {
+  const seps = items.filter((it, i) => i > 0 && it.sep).length;
+  openOverlay({ mod: "todos-menu", kind: "popup", width: 250, height: 12 + items.length * 31 + seps * 9 + (title ? 24 : 0), props: { owner, title, items } });
+}
+
+// Opens argv in a new pane right of the terminal's pane (else the focused one). A zoomed tab
+// would hide the new pane, so it is unzoomed first.
+function splitBeside(terminal, argv) {
+  const all = panes();
+  const f = focused();
+  const target =
+    all.find((p) => p.terminal === terminal) ??
+    all.find((p) => p.pane === f?.pane) ??
+    all.find((p) => p.tab === f?.tab && p.terminal);
+  if (!target) return "No pane to open it beside";
+  const zoomed = all.find((p) => p.tab === target.tab && p.zoomed);
+  if (zoomed) run("pane.zoom", { pane: zoomed.pane });
+  run("pane.split", { pane: target.pane, direction: "right", argv });
+  return null;
+}
+
 const statusClass = (s) => (s === "working" ? "working" : s === "blocked" || s === "error" ? "blocked" : "rest");
 
 export default class Todos extends View {
@@ -114,6 +138,7 @@ export default class Todos extends View {
       for (;;) {
         const c = await nextCommand();
         if (c === "refresh" && this.shownSpace) this.refresh(this.shownSpace, cx, true);
+        else if (c === "menu") this.menuChoice(cx);
       }
     });
   }
@@ -283,6 +308,86 @@ export default class Todos extends View {
     cx.notify();
   }
 
+  // ---------- right-click menus ----------
+
+  taskMenu(a, s, task) {
+    const sp = this.shownSpace;
+    const terminal = a?.address ?? s?.terminal;
+    const level = task.priority ?? "normal";
+    const items = [
+      { label: "Explain this task", icon: CHROME("panel-right"), action: "explain", args: { space: sp, terminal, task: task.key } },
+      { label: "Go to session", icon: CHROME("terminal"), action: "focus", args: { terminal, pane: a?.pane ?? null } },
+    ];
+    if (task.key && task.status !== "done") {
+      const set = (lv, label, icon) => ({ label, icon, action: "priority", args: { terminal, key: task.key, level: lv } });
+      const levels = [set("high", "High priority", ICON("flag-on")), set("normal", "Normal priority", ICON("flag")), set("low", "Low priority", ICON("low"))].filter((it) => it.args.level !== level);
+      levels[0].sep = true;
+      items.push(...levels);
+    }
+    openMenu(NAME, task.text, items);
+  }
+
+  cardMenu(a, s) {
+    const sp = this.shownSpace;
+    const terminal = a?.address ?? s?.terminal;
+    const items = [
+      { label: "Explain where it stands", icon: CHROME("panel-right"), action: "explain", args: { space: sp, terminal } },
+      { label: "Go to session", icon: CHROME("terminal"), action: "focus", args: { terminal, pane: a?.pane ?? null } },
+      { label: "Move to top", icon: CHROME("pin"), action: "top", args: { terminal }, sep: true },
+      { label: "Update now", icon: ICON("refresh"), action: "refresh", args: {} },
+    ];
+    openMenu(NAME, s?.title || s?.name || cleanTitle(a?.title) || "Pi session", items);
+  }
+
+  menuChoice(cx) {
+    const m = shared(`${NAME}.menu`);
+    if (!m || m.at === this.menuSeen) return;
+    this.menuSeen = m.at;
+    const sp = this.shownSpace;
+    const a = m.args ?? {};
+    if (m.action === "explain") this.explain(a.space ?? sp, a.terminal, a.task ?? null, cx);
+    else if (m.action === "focus") {
+      const pane = a.pane ?? panes().find((p) => p.terminal === a.terminal)?.pane;
+      if (pane) showPane(pane);
+      else run("agent.focus", { terminal: a.terminal });
+    } else if (m.action === "priority") this.setPriority(a.terminal, a.key, a.level, cx);
+    else if (m.action === "top") {
+      const list = this.shownOrder ?? [];
+      if (sp && list.includes(a.terminal)) {
+        const order = [a.terminal, ...list.filter((x) => x !== a.terminal)];
+        this.prefs[sp] = { ...this.prefsFor(sp), order };
+        this.save(sp, ["order", "--terminals", order.map((x) => bare(x, where(sp).machine)).join(",")], cx);
+      }
+    } else if (m.action === "refresh" && sp) this.refresh(sp, cx, true);
+    cx.notify();
+  }
+
+  // A new Pi beside the session, on a fork of its conversation, asked to explain (see `explain`
+  // in todos.mjs, which builds the command on the session's own machine).
+  explain(space, terminal, task, cx) {
+    if (!space || !terminal) return;
+    const { machine, id } = where(space);
+    this.notice = "Opening a Pi to explain…";
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const argv = ["explain", "--space", id, "--terminal", bare(terminal, machine)];
+        if (task) argv.push("--task", task);
+        const r = await callHelper(machine, argv, 60_000);
+        if (r.code !== 0) this.errors[space] = `Couldn't open: ${helperError(r, machine)}`;
+        else {
+          const why = splitBeside(terminal, JSON.parse(r.stdout).argv);
+          if (why) this.errors[space] = why;
+          else delete this.errors[space];
+        }
+      } catch (e) {
+        this.errors[space] = `Couldn't open: ${String(e?.message ?? e)}`;
+      }
+      this.notice = null;
+      cx.notify();
+    });
+  }
+
   // ---------- drawing ----------
 
   statusColor(t, s) {
@@ -294,7 +399,7 @@ export default class Todos extends View {
     return status === "working" ? d.loop("opacity", { from: 0.3, to: 1, period: 1400 }) : d;
   }
 
-  taskRow(t, task, i, key, terminal) {
+  taskRow(t, task, i, key, terminal, onMenu) {
     const s = task.status;
     const level = task.priority ?? "normal";
     const rowId = `${key}-t${i}`;
@@ -340,6 +445,10 @@ export default class Todos extends View {
       .id(rowId)
       .gap(8)
       .items_start()
+      .on_mouse_down("right", (_e, cx) => {
+        cx.stop_propagation();
+        onMenu(task);
+      })
       .on_hover((on, cx) => {
         if (on) this.hoverTask = rowId;
         else if (this.hoverTask === rowId) this.hoverTask = null;
@@ -397,6 +506,7 @@ export default class Todos extends View {
       .when(Boolean(this.pressed) && this.over === addr && this.pressed !== addr, (el) =>
         el.child(div().absolute().left(8).right(8).h(3).rounded(2).bg(t.accent).when(dropBelow, (l) => l.bottom(-7)).when(!dropBelow, (l) => l.top(-7))),
       )
+      .on_mouse_down("right", () => this.cardMenu(a, s))
       // Press and release on the same card: go to it. Release on another card: move it there.
       .on_mouse_down("left", () => {
         this.pressed = addr;
@@ -433,7 +543,7 @@ export default class Todos extends View {
       )
       .when(Boolean(tabLabel), (el) => el.child(div().mt(-4).pl(16).truncate().text_size(11).text_color(t.dim).child(tabLabel)))
       .when(Boolean(s?.now), (el) => el.child(div().pl(16).text_size(12).text_color(t.muted).child(s.now)))
-      .when(tasks.length > 0, (el) => el.child(v_flex().pl(2).pt(2).gap(5).children(tasks.map((task, i) => this.taskRow(t, task, i, key, addr)))))
+      .when(tasks.length > 0, (el) => el.child(v_flex().pl(2).pt(2).gap(5).children(tasks.map((task, i) => this.taskRow(t, task, i, key, addr, (task) => this.taskMenu(a, s, task))))))
       .when(hidden > 0, (el) => el.child(div().pl(23).text_size(11).text_color(t.dim).child(`+${hidden} more`)))
       .when(Boolean(placeholder), (el) =>
         el.child(
@@ -529,7 +639,7 @@ export default class Todos extends View {
           .child(busy ? svg(ICON("spinner")).size(13).spin(900) : svg(ICON("refresh")).size(13)),
       );
 
-    const footerText = busy ? "Updating…" : doc?.updated_at ? `Updated ${ago(doc.updated_at) === "now" ? "just now" : `${ago(doc.updated_at)} ago`}` : "";
+    const footerText = this.notice ? this.notice : busy ? "Updating…" : doc?.updated_at ? `Updated ${ago(doc.updated_at) === "now" ? "just now" : `${ago(doc.updated_at)} ago`}` : "";
 
     return v_flex()
       .id("root")

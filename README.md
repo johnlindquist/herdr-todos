@@ -56,6 +56,22 @@ A session seen for the first time contributes only its latest two prompts.
 
 Sessions outside a git repository don't produce suggestions.
 
+## Right-click
+
+- **A task:** Explain this task, Go to session, and the two other priority levels.
+- **A session card:** Explain where it stands, Go to session, Move to top, Update now.
+- **A suggested memory:** Explain where it came from, Keep, Edit, Dismiss, Go to its session.
+- **A kept line** (under *Kept in MEMORIES.md*): Explain where it came from, Edit wording, Remove.
+
+**Explain** opens a new Pi to the right of the session's pane (a zoomed tab is unzoomed so you
+see both). The new Pi is a fork of that session's conversation, made with `pi --fork`: it
+starts with the whole history, while the original session keeps going on its own. Its first
+message names the task, session or memory and asks Pi to explain it from the conversation, then
+wait for you. The message also lists the exact commands that change the sidebar, such as
+setting a priority or keeping, dismissing, rewording or removing a memory, so you can just say
+"keep it, but shorter". The fork runs on the session's own model and machine. A memory with no
+source conversation (one added by hand) opens a fresh Pi in the project folder instead.
+
 ## Install
 
 ```sh
@@ -87,6 +103,13 @@ node todos.mjs priority --space <id> --state ... --terminal t8r --task '#2' --le
 node todos.mjs memories --space <id> --state ...            # or --root <project folder>
 node todos.mjs memory accept|dismiss|edit|remove|restore --root <folder> --id <id> [--text <words>] --state ...
 node todos.mjs memory add --root <folder> --text "<rule>" --state ...
+node todos.mjs explain --space <id> --terminal t8r [--task '#2'] --state ...   # or --root <folder> --memory <id[,id]>
+```
+
+`explain` prints `{kind, name, folder, fork, terminal, prompt, argv}`; open it beside the session
+with `herdr-app do pane.split '{"pane":"<pane>","direction":"right","argv":[...]}'`.
+
+```sh
 ```
 
 Space ids come from `herdr-app status` or `hc get <terminal>` (label `herdr.space`). Task keys

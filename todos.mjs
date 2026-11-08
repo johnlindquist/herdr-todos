@@ -11,6 +11,7 @@
 
 import { execFile, spawn } from "node:child_process";
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -522,6 +523,7 @@ const INJECTED = [
   /^Provider retry activated/,
   /^Inspect subagent updates above/,
   /^Continue the original task from its last verified state/,
+  /^\[From the (?:Todos|Memories) sidebar\]/,
   /^(?:Provider|Model) (?:retry|fallback|switch)/,
   /^\s*</,
   /^\[(?:subagent|hub|system|automated)/i,
@@ -723,6 +725,23 @@ async function proposeMemories({ messages, known }) {
     .map((m) => ({ text: m.text.trim().slice(0, 220), kind: KINDS.includes(m.kind) ? m.kind : "preference", quote: String(m.quote ?? "").slice(0, 160) }));
 }
 
+// When a journal is a fork of another (its header names a parentSession), the moment it was made.
+async function forkTime(file) {
+  const fh = await fs.open(file, "r").catch(() => null);
+  if (!fh) return null;
+  try {
+    const buf = Buffer.alloc(4096);
+    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+    const first = buf.subarray(0, bytesRead).toString("utf8").split("\n")[0];
+    const h = JSON.parse(first);
+    return h.type === "session" && h.parentSession ? Date.parse(h.timestamp) || null : null;
+  } catch {
+    return null;
+  } finally {
+    await fh.close();
+  }
+}
+
 // New prompts in a session since it was last read for memories: each with the reply before it.
 async function extractFrom(session, root) {
   const st = await fs.stat(session.file).catch(() => null);
@@ -732,7 +751,11 @@ async function extractFrom(session, root) {
   if (seen && seen.size === st.size) return;
   const conversation = await recentConversation(session.file);
   // Harness notes arrive as user messages too; they never carry the person's guidance.
-  const users = conversation.filter((m) => m.role === "user" && !INJECTED.some((re) => re.test(m.text)));
+  // A fork (Pi's --fork, /split, an explain pane) repeats its parent's prompts: only its own count.
+  const forkedAt = await forkTime(session.file);
+  const users = conversation.filter(
+    (m) => m.role === "user" && !INJECTED.some((re) => re.test(m.text)) && !(forkedAt && Date.parse(m.at) < forkedAt - 1000),
+  );
   let fresh;
   if (!seen) fresh = users.slice(-MAX_NEW_FIRST_SIGHT);
   else {
@@ -945,6 +968,111 @@ async function refresh(space, force) {
   return { ...(previous ?? { version: VERSION, space, sessions: [], updated_at: null, state: "empty" }), busy: true };
 }
 
+// ---------- explain in a split ----------
+// A right-click on a task, a session or a memory opens a new Pi beside the session it came from,
+// on a fork of that conversation (`pi --fork`: a copy; the original keeps going on its own), with
+// a first message asking it to explain. The person can then ask it to act; the prompt names the
+// commands that change the sidebar. This prints the command; the sidebar (or an agent) opens the
+// pane with `herdr-app do pane.split {pane, direction: "right", argv}`.
+
+const SPLIT_TAG = "[From the Todos sidebar]";
+const MEMORY_TAG = "[From the Memories sidebar]";
+
+function findOnPath(name) {
+  for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (!dir) continue;
+    const p = path.join(dir, name);
+    try {
+      if (fsSync.statSync(p).isFile()) return p;
+    } catch {}
+  }
+  return null;
+}
+
+// This file's path when run from disk; null when piped to another machine's Node.
+function selfPath() {
+  try {
+    const u = new URL(import.meta.url);
+    return u.protocol === "file:" ? decodeURIComponent(u.pathname) : null;
+  } catch {
+    return null;
+  }
+}
+
+const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+
+function launchArgv({ folder, fork, name, prompt }) {
+  const pi = findOnPath("pi");
+  if (!pi) fail("NO_PI", "pi is not on PATH here");
+  const piArgv = [pi, ...(fork ? ["--fork", fork] : []), "--name", name, prompt];
+  // pane.split takes argv, not a folder: cd there first, paths passed as data, never as shell source.
+  return ["/bin/sh", "-c", 'cd "$1" && shift && exec "$@"', "todos-explain", folder, "/usr/bin/env", `PATH=${process.env.PATH ?? ""}`, ...piArgv];
+}
+
+const short = (t, n) => (t.length > n ? `${t.slice(0, n - 1).trimEnd()}…` : t);
+
+async function explainTask(space, terminal, taskKey) {
+  const doc = await readJson(spaceFile(space), null);
+  const s = doc?.sessions?.find((x) => x.terminal === terminal);
+  if (!s) fail("NOT_FOUND", `no session ${terminal} in space ${space}; refresh first`);
+  const prefs = await readPrefs(space);
+  const task = taskKey ? (s.tasks ?? []).find((t) => (t.key ?? taskKey) === taskKey || taskKey === `#${t.id}`) : null;
+  if (taskKey && !task) fail("NOT_FOUND", `no task ${taskKey} on ${terminal}`);
+  const helperPath = selfPath();
+  const level = task ? prefs.priority[`${terminal}|${task.key}`] ?? "normal" : null;
+  const lines = [SPLIT_TAG];
+  lines.push("This is a split of the conversation above: a copy. The original session keeps going on its own, so don't repeat or undo its work.");
+  if (task) {
+    lines.push("", `The sidebar lists this task for it: "${task.text}" (status: ${task.status.replace("_", " ")}${level !== "normal" ? `, priority: ${level}` : ""}).`);
+    lines.push("", "Explain it from the conversation, briefly: what it is and why it came up, where it stands now, and what is left or what it is waiting on. Then wait for me.");
+  } else {
+    lines.push("", `The sidebar shows this session as "${s.title ?? s.name ?? "Pi session"}"${s.now ? `, now: "${s.now}"` : ""}, with these tasks:`);
+    for (const t of s.tasks ?? []) lines.push(`- ${t.text} (${t.status.replace("_", " ")})`);
+    lines.push("", "Explain briefly where this session stands: what was asked, what is done, what is left, and anything it needs from me. Then wait for me.");
+  }
+  lines.push("", "If I ask, you can act: continue the work here, or change the sidebar:");
+  if (helperPath && task) lines.push(`- priority: node ${q(helperPath)} priority --space ${space} --terminal ${terminal} --task ${q(task.key)} --level high|normal|low --state ${q(stateDir)}`);
+  if (helperPath) lines.push(`- refresh the task lists: node ${q(helperPath)} refresh --space ${space} --force --state ${q(stateDir)}`);
+  else lines.push("- (the sidebar's commands run on the machine showing Herdr, not here)");
+  const name = short(`Explain: ${task ? task.text : s.title ?? s.name ?? "session"}`, 48);
+  const fork = s.file && (await fs.stat(s.file).catch(() => null)) ? s.file : null;
+  if (!fork) fail("NO_JOURNAL", "this session's conversation wasn't found, so there is nothing to explain from yet");
+  const folder = s.cwd || os.homedir();
+  const prompt = lines.join("\n");
+  return { kind: task ? "task" : "session", terminal, name, folder, fork, prompt, argv: launchArgv({ folder, fork, name, prompt }) };
+}
+
+async function explainMemory(root, idArg) {
+  const ids = String(idArg).split(",").map((x) => x.trim()).filter(Boolean);
+  const store = await readStore(root);
+  const items = ids.map((id) => store.items.find((m) => m.id === id)).filter(Boolean);
+  if (!items.length) fail("NOT_FOUND", `no memory ${idArg} for ${root}`);
+  const withFile = [];
+  for (const m of items) if (m.source?.file && (await fs.stat(m.source.file).catch(() => null))) withFile.push(m);
+  const from = withFile[0] ?? null;
+  const line = store.rendered?.items?.find((it) => ids.every((id) => it.ids.includes(id)));
+  const kept = items.every((m) => m.status === "accepted");
+  const shown = line ? `${line.label ? `${line.label}: ` : ""}${line.text}` : items[0].text;
+  const helperPath = selfPath();
+  const lines = [MEMORY_TAG];
+  if (from) lines.push("This is a split of the conversation above: a copy. The original session keeps going on its own.");
+  lines.push("", kept ? `This rule is kept in ${path.join(root, MEMORY_FILE)}: "${shown}".` : `The sidebar suggests remembering this rule for the project: "${shown}".`);
+  for (const m of items) if (m.quote) lines.push(`The suggestion quoted: "${m.quote}"`);
+  if (from) lines.push("", "Explain where it came from in this conversation, briefly: which message, what I was reacting to, and whether it is a lasting rule for this project or only mattered for that task. Suggest clearer wording if it helps. Then wait for me.");
+  else lines.push("", `Its source conversation isn't available. Read ${MEMORY_FILE} and AGENTS.md here and explain, briefly, what the rule means for work in this project and whether it still fits. Suggest clearer wording if it helps. Then wait for me.`);
+  if (helperPath) {
+    const base = `node ${q(helperPath)} memory`;
+    const tail = `--root ${q(root)} --id ${ids.join(",")} --state ${q(stateDir)}`;
+    lines.push("", "When I decide, act with these (they update the sidebar and MEMORIES.md):");
+    if (!kept) lines.push(`- keep: ${base} accept ${tail} [--text "better wording"]`, `- dismiss: ${base} dismiss ${tail}`);
+    else lines.push(`- reword: ${base} edit ${tail} --text "new wording"`, `- remove: ${base} remove ${tail}`);
+  }
+  const name = short(`Explain: ${shown.replace(/^[^:]{1,30}:\s*/, "")}`, 48);
+  const folder = root;
+  const prompt = lines.join("\n");
+  return { kind: "memory", ids, name, folder, fork: from?.source.file ?? null, terminal: from?.source.terminal ?? null, prompt, argv: launchArgv({ folder, fork: from?.source.file ?? null, name, prompt }) };
+}
+
 const DESCRIBE = {
   name: "herdr-todos",
   version: VERSION,
@@ -955,6 +1083,7 @@ const DESCRIBE = {
     priority: "priority --space <id> --terminal <t> --task <key> --level high|normal|low: rank one task (keys are in each task's `key`)",
     memories: "memories --space <id> | --root <folder>: candidate and kept memories for the space's projects (git roots of its Pi sessions)",
     memory: "memory accept|dismiss|edit|remove|restore --root <folder> --id <id> [--text <words>]; memory add --root <folder> --text <words>: accept rewrites <root>/MEMORIES.md (merged, grouped, terse) and links it from <root>/AGENTS.md; --id takes several ids (a,b) for a merged line",
+    explain: "explain --space <id> --terminal <t> [--task <key>] | explain --root <folder> --memory <id[,id]>: the command that opens a Pi beside the session on a fork of its conversation (`pi --fork`), asked to explain the task, session or memory and given the sidebar commands to act; open it with `herdr-app do pane.split '{\"pane\":...,\"direction\":\"right\",\"argv\":[...]}'`. Prints {kind, name, folder, fork, terminal, prompt, argv}",
     describe: "this description",
   },
   output: {
@@ -993,6 +1122,16 @@ try {
     const root = path.resolve(expandHome(args.root));
     const m = await memoryAction(action, root, args.id, typeof args.text === "string" ? args.text : null);
     process.stdout.write(JSON.stringify({ root, memory: m }) + "\n");
+  } else if (cmd === "explain") {
+    let out;
+    if (typeof args.memory === "string") {
+      if (typeof args.root !== "string") fail("INVALID", "--root <project folder> is required with --memory");
+      out = await explainMemory(path.resolve(expandHome(args.root)), args.memory);
+    } else {
+      if (typeof args.space !== "string" || typeof args.terminal !== "string") fail("INVALID", "--space and --terminal (or --root and --memory) are required");
+      out = await explainTask(args.space, args.terminal, typeof args.task === "string" ? args.task : null);
+    }
+    process.stdout.write(JSON.stringify(out) + "\n");
   } else if (cmd === "order" || cmd === "priority") {
     if (typeof args.space !== "string") fail("INVALID", "--space <id> is required");
     const prefs = await readPrefs(args.space);
