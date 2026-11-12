@@ -1,1 +1,1 @@
-{ "place": "right", "size": 304, "title": "Todos" }
+{ "place": "right", "size": 304, "title": "Todos", "focusable": true }

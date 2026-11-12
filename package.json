@@ -1,0 +1,6 @@
+{
+  "name": "herdr-todos",
+  "private": true,
+  "type": "module",
+  "scripts": { "check": "sh fence.sh", "test": "node --test test/*.test.mjs" }
+}

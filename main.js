@@ -5,7 +5,8 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { agents, spaces, focused, panes, exec, home, appHome, run, theme, readTextFile, nextCommand, shared, setShared, openOverlay } from "herdr";
+import { agents, spaces, focused, panes, exec, home, appHome, run, theme, readTextFile, nextCommand, shared, setShared, openOverlay, layout } from "herdr";
+import { step, widgetDirection, COLLAPSE_KEY, loadCollapsed, applyCollapse, returnTarget, tip, keepInView, wheelTop, maxTop, fitCount, estimateViewport } from "./nav.js";
 
 const NAME = "todos";
 const ICON = (n) => `mods/${NAME}/icons/${n}.svg`;
@@ -112,6 +113,69 @@ function splitBeside(terminal, argv) {
 
 const statusClass = (s) => (s === "working" ? "working" : s === "blocked" || s === "error" ? "blocked" : "rest");
 
+// The list shows items from `top` and clips the rest; ↑/↓ and the wheel move `top` only as
+// needed (the rules and their tests are in nav.js). Shared shape across the three widgets.
+function windowedList(view, t, id, heights, render, chromePx, mod) {
+  const vp = view.viewH ?? estimateViewport(layout(), mod, windowHeight(), chromePx);
+  view.lastHeights = heights;
+  view.lastVp = vp;
+  view.top = Math.min(view.top ?? 0, maxTop(heights, vp));
+  const shown = fitCount(heights, view.top, vp);
+  const more = heights.length > shown;
+  const list = div()
+    .id(id)
+    .flex_1()
+    .min_h(60)
+    .overflow_hidden()
+    .relative()
+    .on_mouse_move((e) => {
+      if (e.bounds?.height) view.viewH = e.bounds.height;
+    })
+    .on_scroll_wheel((e, cx) => {
+      if (e.bounds?.height) view.viewH = e.bounds.height;
+      view.top = wheelTop(view.top, e.delta.y, heights, view.viewH ?? vp);
+      cx.notify();
+    })
+    .child(v_flex().children(heights.slice(view.top, view.top + shown + 1).map((h, j) => div().h(h).flex_none().child(render(view.top + j)))));
+  return v_flex()
+    .flex_1()
+    .min_h(76)
+    .child(list)
+    .when(more, (el) => el.child(div().flex_none().h(16).px(14).text_size(10).text_color(t.dim).child(`Showing ${view.top + 1}–${Math.min(heights.length, view.top + shown)} of ${heights.length} · scroll or ↑↓`)));
+}
+
+const windowHeight = () => {
+  try {
+    return /** @type {any} */ (globalThis).window?.viewport_size?.().height ?? 900;
+  } catch {
+    return 900;
+  }
+};
+
+// The key legend under the list (the same shape in Issues, Todos and Memories).
+function legend(t, keys) {
+  return h_flex()
+    .flex_none()
+    .px(12)
+    .py(5)
+    .gap_x(8)
+    .gap_y(3)
+    .flex_wrap()
+    .border_t(1)
+    .border_color(t.border)
+    .children(
+      keys.map(([k, label]) =>
+        h_flex()
+          .id(`legend-${label}`)
+          .gap(4)
+          .items_center()
+          .tooltip(tip({ Next: "Next widget", Back: "Back to Main", Select: "Select" }[label] ?? label, k))
+          .child(div().px(4).rounded(3).border(1).border_color(t.border).text_size(10).text_color(t.foreground).child(k))
+          .child(div().text_size(10.5).text_color(t.dim).child(label)),
+      ),
+    );
+}
+
 export default class Todos extends View {
   init(_props, cx) {
     this.cache = {}; // space id -> last helper document
@@ -128,6 +192,14 @@ export default class Todos extends View {
     this.lastRun = {}; // space id -> ms of the last finished refresh
     this.seen = null; // pi agent address -> status class, from the last tick
     this.shownSpace = null;
+    this.collapsed = loadCollapsed(localStorage, NAME);
+    this.handle = cx.focus_handle();
+    this.top = 0;
+    this.viewH = null;
+    this.lastHeights = null; // the list's row heights and height, from the last render
+    this.lastVp = 0;
+    this.sel = null; // the selected card's terminal address
+    this.before = null; // what had the keyboard before this widget took it
     this.tick(cx);
     cx.timer.every(2000, (cx) => this.tick(cx));
     cx.timer.every(PERIODIC_MS, (cx) => {
@@ -139,6 +211,9 @@ export default class Todos extends View {
         const c = await nextCommand();
         if (c === "refresh" && this.shownSpace) this.refresh(this.shownSpace, cx, true);
         else if (c === "menu") this.menuChoice(cx);
+        else if (c === "focus") this.takeKeyboard();
+        else this.command(c, cx);
+        cx.notify();
       }
     });
   }
@@ -388,6 +463,60 @@ export default class Todos extends View {
     });
   }
 
+  // ---------- keyboard: the shared rules in nav.js ----------
+
+  takeKeyboard() {
+    const f = focused();
+    if (!this.handle.is_focused() && f && (f.pane || f.terminal)) this.before = { pane: f.pane, terminal: f.terminal };
+    if (this.collapsed) this.setCollapsed(false);
+    this.handle.focus();
+    this.reveal();
+  }
+
+  setCollapsed(on) {
+    this.collapsed = on;
+    applyCollapse({ mod: NAME, collapsed: on, storage: localStorage, layout, run });
+  }
+
+  reveal() {
+    const at = (this.shownOrder ?? []).indexOf(this.sel);
+    if (at >= 0 && this.lastHeights) this.top = keepInView(this.top, at, this.lastHeights, this.lastVp);
+  }
+
+  /** Keys and commands share one path. Returns true when handled. */
+  command(k, cx) {
+    if (k === "escape") {
+      const t = returnTarget(this.before, null);
+      this.before = null;
+      if (t) run("pane.focus", t);
+      return true;
+    }
+    if (k === COLLAPSE_KEY || k === "collapse") return (this.setCollapsed(!this.collapsed), true);
+    if (k === "r") return (this.shownSpace && this.refresh(this.shownSpace, cx, true), true);
+    const dir = widgetDirection(k);
+    if (dir) return (run("pane.go", { direction: dir }), true);
+    if (this.collapsed) return false;
+    const list = this.shownOrder ?? [];
+    const at = Math.max(0, list.indexOf(this.sel));
+    const next = step(at, list.length, k);
+    if (next != null) {
+      this.sel = list[next];
+      this.reveal();
+      return true;
+    }
+    const a = agents().find((x) => x.address === (list.includes(this.sel) ? this.sel : list[0]));
+    if (k === "enter" && a) {
+      showPane(a.pane);
+      return true;
+    }
+    if ((k === "shift-f10" || k === "menu-key") && a) {
+      const s = this.cache[this.shownSpace]?.sessions?.find((x) => x.terminal === a.address);
+      this.cardMenu(a, s);
+      return true;
+    }
+    return false;
+  }
+
   // ---------- drawing ----------
 
   statusColor(t, s) {
@@ -418,7 +547,7 @@ export default class Todos extends View {
       .text_size(12.5)
       .text_color(s === "done" || low ? t.dim : s === "todo" ? t.muted : s === "blocked" ? t.blocked : t.foreground)
       .when(level === "high" && s !== "done", (el) => el.font_medium().text_color(s === "blocked" ? t.blocked : t.foreground))
-      .when(s === "done", (el) => el.truncate())
+      .truncate()
       .child(task.text);
     // The flag: shown when set, or on hover. Click: normal -> high -> low -> normal.
     const showFlag = s !== "done" && task.key && (level !== "normal" || this.hoverTask === rowId);
@@ -443,8 +572,10 @@ export default class Todos extends View {
       );
     return h_flex()
       .id(rowId)
+      .h(18)
       .gap(8)
       .items_start()
+      .tooltip(`${task.text}\n\nRight-click: explain, go to session, priority`)
       .on_mouse_down("right", (_e, cx) => {
         cx.stop_propagation();
         onMenu(task);
@@ -459,10 +590,9 @@ export default class Todos extends View {
       .child(showFlag ? flag : div().w(16).flex_none());
   }
 
-  card(t, a, s, busy, showTab, dropBelow) {
-    const addr = a?.address ?? s?.terminal;
-    const status = a?.status ?? s?.status ?? "idle";
-    const title = s?.title || s?.name || cleanTitle(a?.title) || "Pi session";
+  // What a card shows, and so its exact height: the list is virtual and places cards by it.
+  // Every line is one line (truncated; the full text is in its tooltip).
+  shape(a, s, busy, showTab) {
     const sorted = [...(s?.tasks ?? [])].sort(
       (x, y) => (TASK_ORDER[x.status] ?? 9) - (TASK_ORDER[y.status] ?? 9) || (LEVEL[x.priority] ?? 1) - (LEVEL[y.priority] ?? 1),
     );
@@ -470,35 +600,39 @@ export default class Todos extends View {
     const pick = (st, n) => sorted.filter((x) => x.status === st).filter((x, i) => i < n || x.priority === "high");
     const tasks = [...pick("blocked", 9), ...pick("in_progress", 9), ...pick("todo", 3), ...pick("done", 2)];
     const hidden = sorted.length - tasks.length;
-    const key = `c-${a?.address ?? s?.terminal}`;
-    const needsYou = status === "blocked";
     // Only when it tells sessions apart: a named tab, or sessions spread over several tabs.
     const tabLabel = !a ? null : a.tab_name && !/^\d+$/.test(a.tab_name) ? a.tab_name : showTab ? `Tab ${a.tab_index}` : null;
+    const placeholder = !s ? (busy ? "Reading this session…" : "Not read yet") : !tasks.length && !s.now ? (s.error ? null : "No tasks yet") : null;
+    const parts = [tabLabel ? 14 : 0, s?.now ? 24 : 0, tasks.length ? 6 + tasks.length * 18 + (tasks.length - 1) * 5 + 7 : 0, hidden > 0 ? 22 : 0, placeholder ? 24 : 0, s?.error ? 22 : 0];
+    return { tasks, hidden, tabLabel, placeholder, height: 22 + 20 + parts.reduce((n, x) => n + x, 0) };
+  }
+
+  card(t, a, s, busy, showTab, dropBelow) {
+    const addr = a?.address ?? s?.terminal;
+    const status = a?.status ?? s?.status ?? "idle";
+    const title = s?.title || s?.name || cleanTitle(a?.title) || "Pi session";
+    const { tasks, hidden, tabLabel, placeholder, height } = this.shape(a, s, busy, showTab);
+    const key = `c-${a?.address ?? s?.terminal}`;
+    const needsYou = status === "blocked";
+    const selected = addr === this.sel && this.handle.is_focused();
     const sourceIcon =
       s?.source === "board"
         ? svg(ICON("board")).size(11).flex_none().text_color(t.dim)
         : s?.source === "haiku"
           ? svg(ICON("sparkle")).size(11).flex_none().text_color(t.dim)
           : null;
-    const placeholder = !s
-      ? busy
-        ? "Reading this session…"
-        : "Not read yet"
-      : !tasks.length && !s.now
-        ? s.error
-          ? null
-          : "No tasks yet"
-        : null;
-
     return v_flex()
       .id(key)
       .flex_none()
+      .h(height)
+      .overflow_hidden()
       .p(10)
       .gap(7)
       .rounded(10)
       .bg(t.background)
       .border(1)
-      .border_color(needsYou ? t.blocked : a?.focused ? t.input : t.border)
+      .border_color(selected ? t.accent : needsYou ? t.blocked : a?.focused ? t.input : t.border)
+      .tooltip(`${title}${s?.now ? `\n${s.now}` : ""}\n\n${tip("Go to session", "Enter")} · drag to reorder · right-click or ⇧F10 for more`)
       .relative()
       .cursor_pointer()
       .hover((el) => el.border_color(t.input))
@@ -542,7 +676,7 @@ export default class Todos extends View {
           .when(Boolean(s?.summarized_at), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(ago(s.summarized_at)))),
       )
       .when(Boolean(tabLabel), (el) => el.child(div().mt(-4).pl(16).truncate().text_size(11).text_color(t.dim).child(tabLabel)))
-      .when(Boolean(s?.now), (el) => el.child(div().pl(16).text_size(12).text_color(t.muted).child(s.now)))
+      .when(Boolean(s?.now), (el) => el.child(div().pl(16).h(17).truncate().text_size(12).text_color(t.muted).child(s.now)))
       .when(tasks.length > 0, (el) => el.child(v_flex().pl(2).pt(2).gap(5).children(tasks.map((task, i) => this.taskRow(t, task, i, key, addr, (task) => this.taskMenu(a, s, task))))))
       .when(hidden > 0, (el) => el.child(div().pl(23).text_size(11).text_color(t.dim).child(`+${hidden} more`)))
       .when(Boolean(placeholder), (el) =>
@@ -616,15 +750,23 @@ export default class Todos extends View {
     if (!sp) empty = "No space shown";
     else if (!rows.length) empty = busy && !doc ? "Reading sessions…" : "No Pi sessions in this space";
 
+    const hasKeys = this.handle.is_focused();
+    const summary = [needsYou ? `${needsYou} needs you` : null, count("in_progress") ? `${count("in_progress")} doing` : null, count("todo") ? `${count("todo")} next` : null].filter(Boolean).join(" · ") || `${rows.length} sessions`;
+    if (!rows.some((r) => r.a.address === this.sel)) this.sel = rows[0]?.a.address ?? null;
     const header = h_flex()
+      .id("todos-header")
       .px(14)
-      .h(44)
-      .pt(10)
+      .h(36)
       .flex_none()
       .gap(8)
       .items_center()
-      .child(div().flex_none().text_size(11.5).font_medium().text_color(t.dim).child("Todos"))
-      .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.muted).child(space?.name ?? ""))
+      .cursor_pointer()
+      .hover((s) => s.bg(t.hover))
+      .tooltip(tip(this.collapsed ? "Expand Todos" : "Collapse Todos", "−"))
+      .on_click(() => this.setCollapsed(!this.collapsed))
+      .child(div().flex_none().text_size(10).text_color(t.dim).child(this.collapsed ? "▸" : "▾"))
+      .child(div().flex_none().text_size(11.5).font_medium().text_color(hasKeys ? t.accent : t.dim).child("Todos"))
+      .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.muted).child(this.collapsed ? `· ${summary}` : space?.name ?? ""))
       .child(
         div()
           .id("todos-refresh")
@@ -634,22 +776,34 @@ export default class Todos extends View {
           .text_color(t.dim)
           .cursor_pointer()
           .hover((s) => s.bg(t.hover).text_color(t.foreground))
-          .tooltip(busy ? "Updating…" : "Update now")
-          .on_click((_e, cx) => sp && this.refresh(sp, cx, true))
+          .tooltip(busy ? "Updating…" : tip("Update now", "R"))
+          .on_click((_e, cx) => {
+            cx.stop_propagation();
+            sp && this.refresh(sp, cx, true);
+          })
           .child(busy ? svg(ICON("spinner")).size(13).spin(900) : svg(ICON("refresh")).size(13)),
       );
 
     const footerText = this.notice ? this.notice : busy ? "Updating…" : doc?.updated_at ? `Updated ${ago(doc.updated_at) === "now" ? "just now" : `${ago(doc.updated_at)} ago`}` : "";
 
-    return v_flex()
+    const shell = v_flex()
       .id("root")
+      .track_focus(this.handle)
+      .on_key_down((e, cx) => {
+        if (this.command(e.keystroke, cx)) cx.notify();
+      })
       .size_full()
       .min_h(0)
       .bg(t.chrome)
       .border_l(1)
       .border_color(t.border)
+      .when(hasKeys, (el) => el.border_t(2).border_color(t.accent))
       .text_size(13)
-      .child(header)
+      .child(header);
+    if (this.collapsed) return shell;
+    const showTab = new Set(rows.map((r) => r.a.tab)).size > 1;
+    const heights = rows.map(({ a, s }) => this.shape(a, s, busy, showTab).height + 8);
+    return shell
       .when(chips.length > 0 && !empty, (el) => el.child(h_flex().px(12).pb(8).pt(2).gap(6).flex_wrap().flex_none().children(chips)))
       .when(Boolean(empty), (el) =>
         el.child(
@@ -665,23 +819,15 @@ export default class Todos extends View {
       )
       .when(!empty, (el) =>
         el.child(
-          v_flex()
-            .id("todos-list")
-            .flex_1()
-            .min_h(0)
-            .px(10)
-            .pb(10)
-            .gap(8)
-            .overflow_y_scrollbar()
-            .on_mouse_up("left", (_e, cx) => {
-              this.pressed = null;
-              this.over = null;
-              cx.notify();
-            })
-            .children(rows.map(({ a, s }, i) => this.card(t, a, s, busy, new Set(rows.map((r) => r.a.tab)).size > 1, pressedAt >= 0 && pressedAt < i))),
+          windowedList(this, t, "todos-list", heights, (i) => div().px(10).pb(8).child(this.card(t, rows[i].a, rows[i].s, busy, showTab, pressedAt >= 0 && pressedAt < i)), 150, NAME).on_mouse_up("left", (_e, cx) => {
+            this.pressed = null;
+            this.over = null;
+            cx.notify();
+          }),
         ),
       )
       .when(Boolean(empty), (el) => el.child(div().flex_1()))
+      .child(legend(t, [["↑↓", "Select"], ["Enter", "Go to session"], ["Tab", "Next"], ["−", "Collapse"], ["Esc", "Back"]]))
       .child(
         v_flex()
           .flex_none()
