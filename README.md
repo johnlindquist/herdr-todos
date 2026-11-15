@@ -122,6 +122,26 @@ node todos.mjs config
 
 Add `--state ~/.cache/herdr-todos/default` to read and change what the sidebar shows. Space ids come from `herdr-app status`.
 
+## Move it, pop it out, close it
+
+Todos has a title bar: its name, its own controls, then **Pop out** (↗) and **Close** (×). The keys work while Todos has the keyboard and are listed in its legend.
+
+| You want | Pointer | Key | Command (for agents) |
+|---|---|---|---|
+| Put it above or below another widget | drag the title bar onto that widget: top half lands above, bottom half below | Shift+↑ / Shift+↓ (inside one column) | `herdr-app do todos.move-up`, `todos.move-down`, `todos.move-before:<widget>`, `todos.move-after:<widget>` |
+| Move it to the other side of the window | drag the title bar, release on "Left side" or "Right side" in the widget | Shift+← / Shift+→ | `herdr-app do todos.move-left`, `todos.move-right` |
+| Make it a free window | ↗ | Shift+O | `herdr-app do todos.popout` |
+| Dock the window back | ↙ | Shift+O | `herdr-app do todos.dock` |
+| Close it | × | Shift+W | `herdr-app do todos.close` |
+| Open it again | command palette: `mod.open`, then `todos` | bind one in `keys.json`: `"cmd-shift-9": "mod.open:todos"` | `herdr-app do mod.open --name todos` |
+
+- Esc cancels a drag. A drag nobody finishes is forgotten after 20 seconds.
+- Moving changes your layout through Herdr's own `layout.set`. Herdr does not let anything rearrange its own layouts (Herdr, Terminals, Herdr 98): there the widget says so in one line. Duplicate the layout first (command palette: Duplicate layout), then move widgets in your copy. Pop out, dock and close work in every layout.
+- The window remembers its spot and comes back on the next start. While it floats, the docked place is hidden; selection, scroll and collapse carry over.
+- A closed widget is not loaded, so `todos.open` cannot reach it: reopening is Herdr's `mod.open`, which brings it back where it was (docked or floating). `mod.open` on an open window closes it.
+- Only the copy on screen works. Closed, Todos reads nothing and calls no model; if it was shown earlier in this run, its two-second timer still wakes and returns at once.
+- Agents read where it is from shared state `frame.todos` (in `shared.json` in the Herdr app's folder): `mode` (`docked`, `floating`, `closed`), `last`, `side`, `parent`, `index`, `above`, `below`, and `error` with a name (`shipped-layout`, `nothing-above`, `nothing-below`, `already-there`, `no-target`, `not-in-layout`, `already-floating`, `already-docked`, `unknown-move`).
+
 ## Troubleshooting
 
 - **`./install.sh` says a mod failed its check.** The message names the file and the line. This page was checked on Herdr 0.1.14; update Herdr if yours is older.
@@ -182,6 +202,8 @@ What was checked for 0.2.0 on 2026-11-15 (macOS, Herdr 0.1.14, Pi 1.5.0, Node 25
 npm install
 npm run check
 ```
+
+Moving, popping out and closing (2026-11-15): `frame.js` has 12 tests that run without Herdr (where a drop lands, how the layout is rewritten, what is remembered, one engine). In a second, separate Herdr window on a duplicated layout, through commands, with the layout read back each time: reorder, move to the other side and back, pop out (window open, docked place hidden), dock back, close and reopen with `mod.open`, docked and floating. Not run: a real drag with the pointer, and the Shift keys pressed by hand.
 
 ## License
 
