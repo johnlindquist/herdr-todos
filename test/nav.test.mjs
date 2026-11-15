@@ -50,7 +50,7 @@ test("Esc returns to the pane that had the keyboard, else Main", () => {
 test("every widget carries the same navigation rules (copies match)", () => {
   const mine = fs.readFileSync(path.join(here, "..", "nav.js"), "utf8");
   // Sibling checkouts of the other widgets that share these rules are compared when they are there.
-  const others = ["herdr-todos", "herdr-memories", "herdr-triage"].map((r) => path.join(here, "..", "..", r, "nav.js")).filter((f) => fs.existsSync(f));
+  const others = ["herdr-todos", "herdr-memories", "herdr-issues", "herdr-triage"].map((r) => path.join(here, "..", "..", r, "nav.js")).filter((f) => fs.existsSync(f));
   for (const f of others) assert.ok(fs.readFileSync(f, "utf8") === mine, `${f} differs from this copy`);
 });
 
