@@ -5,8 +5,9 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { agents, spaces, focused, panes, exec, home, appHome, run, theme, readTextFile, nextCommand, shared, setShared, openOverlay, layout } from "herdr";
+import { agents, spaces, focused, panes, exec, home, appHome, run, theme, readTextFile, nextCommand, shared, setShared, openOverlay, closeOverlay, props, layout } from "herdr";
 import { step, widgetDirection, COLLAPSE_KEY, loadCollapsed, applyCollapse, returnTarget, tip, keepInView, wheelTop, maxTop, fitCount, estimateViewport } from "./nav.js";
+import { createFrame, frameParts } from "./frame.js";
 
 const NAME = "todos";
 const ICON = (n) => `mods/${NAME}/icons/${n}.svg`;
@@ -200,6 +201,15 @@ export default class Todos extends View {
     this.lastVp = 0;
     this.sel = null; // the selected card's terminal address
     this.before = null; // what had the keyboard before this widget took it
+    // Title bar, move, pop out, close: the shared rules in frame.js. Only the copy on screen works.
+    this.frame = createFrame({ mod: NAME, h: { layout, run, shared, setShared, openOverlay, closeOverlay, props } });
+    const carried = this.frame.start();
+    if (carried) {
+      this.sel = carried.sel ?? null;
+      this.top = carried.top ?? 0;
+      if (typeof carried.collapsed === "boolean") this.collapsed = carried.collapsed;
+    }
+    if (this.frame.floating) this.handle.focus();
     this.tick(cx);
     cx.timer.every(2000, (cx) => this.tick(cx));
     cx.timer.every(PERIODIC_MS, (cx) => {
@@ -221,6 +231,8 @@ export default class Todos extends View {
   // Watches the live agent list (no redraw unless something changed) and queues refreshes:
   // the shown space when it changes, any space whose Pi session changed state.
   tick(cx) {
+    this.frame.check();
+    if (!this.frame.active()) return (this.seen = null);
     const sp = focused()?.space ?? null;
     if (sp && sp !== this.shownSpace) {
       this.shownSpace = sp;
@@ -248,7 +260,7 @@ export default class Todos extends View {
 
   periodic(cx) {
     const sp = this.shownSpace;
-    if (!sp) return;
+    if (!sp || !this.frame.active()) return;
     const working = agents().some((a) => a.space === sp && a.app === "pi" && a.status === "working");
     const since = Date.now() - (this.lastRun[sp] ?? 0);
     if (working || since > QUIET_MS) this.want(sp, cx, 0);
@@ -291,6 +303,7 @@ export default class Todos extends View {
   }
 
   refresh(space, cx, force) {
+    if (!this.frame.active()) return; // hidden or closed: no reading, no model calls
     if (this.busy.has(space)) {
       this.again.add(space);
       return;
@@ -473,8 +486,25 @@ export default class Todos extends View {
     this.reveal();
   }
 
+  // What the next copy (the window, or the docked block again) starts from.
+  viewState() {
+    return { sel: this.sel, top: this.top, collapsed: this.collapsed };
+  }
+
+  close() {
+    this.frame.closed();
+  }
+
+  // Takes the keyboard without expanding or scrolling (a press on the title bar).
+  takeKeyboardQuietly() {
+    const f = focused();
+    if (f && (f.pane || f.terminal)) this.before = { pane: f.pane, terminal: f.terminal };
+    this.handle.focus();
+  }
+
   setCollapsed(on) {
     this.collapsed = on;
+    if (this.frame.floating) return; // a window has no column to give its height to
     applyCollapse({ mod: NAME, collapsed: on, storage: localStorage, layout, run });
   }
 
@@ -485,6 +515,8 @@ export default class Todos extends View {
 
   /** Keys and commands share one path. Returns true when handled. */
   command(k, cx) {
+    if (k === "escape" && this.frame.dragging() === "mine") return (this.frame.dragCancel(), true);
+    if (this.frame.command(k, this.viewState())) return true;
     if (k === "escape") {
       const t = returnTarget(this.before, null);
       this.before = null;
@@ -753,6 +785,7 @@ export default class Todos extends View {
     const hasKeys = this.handle.is_focused();
     const summary = [needsYou ? `${needsYou} needs you` : null, count("in_progress") ? `${count("in_progress")} doing` : null, count("todo") ? `${count("todo")} next` : null].filter(Boolean).join(" · ") || `${rows.length} sessions`;
     if (!rows.some((r) => r.a.address === this.sel)) this.sel = rows[0]?.a.address ?? null;
+    const parts = frameParts({ div, h_flex, v_flex }, t, this.frame, tip, () => this.viewState());
     const header = h_flex()
       .id("todos-header")
       .px(14)
@@ -762,8 +795,13 @@ export default class Todos extends View {
       .items_center()
       .cursor_pointer()
       .hover((s) => s.bg(t.hover))
-      .tooltip(tip(this.collapsed ? "Expand Todos" : "Collapse Todos", "−"))
+      .tooltip(this.frame.floating ? "Todos · drag to move the window" : `${tip(this.collapsed ? "Expand Todos" : "Collapse Todos", "−")} · drag onto another widget to move it`)
       .on_click(() => this.setCollapsed(!this.collapsed))
+      // Pressing the bar starts a drag: release over another widget to land above or below it.
+      .on_mouse_down("left", () => {
+        if (!this.handle.is_focused()) this.takeKeyboardQuietly();
+        this.frame.dragStart();
+      })
       .child(div().flex_none().text_size(10).text_color(t.dim).child(this.collapsed ? "▸" : "▾"))
       .child(div().flex_none().text_size(11.5).font_medium().text_color(hasKeys ? t.accent : t.dim).child("Todos"))
       .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.muted).child(this.collapsed ? `· ${summary}` : space?.name ?? ""))
@@ -782,7 +820,8 @@ export default class Todos extends View {
             sp && this.refresh(sp, cx, true);
           })
           .child(busy ? svg(ICON("spinner")).size(13).spin(900) : svg(ICON("refresh")).size(13)),
-      );
+      )
+      .children(parts.buttons);
 
     const footerText = this.notice ? this.notice : busy ? "Updating…" : doc?.updated_at ? `Updated ${ago(doc.updated_at) === "now" ? "just now" : `${ago(doc.updated_at)} ago`}` : "";
 
@@ -799,7 +838,11 @@ export default class Todos extends View {
       .border_color(t.border)
       .when(hasKeys, (el) => el.border_t(2).border_color(t.accent))
       .text_size(13)
-      .child(header);
+      .relative()
+      .on_mouse_up("left", () => this.frame.dragCancel())
+      .child(header)
+      .when(Boolean(parts.note), (el) => el.child(parts.note))
+      .when(Boolean(parts.drop), (el) => el.child(parts.drop));
     if (this.collapsed) return shell;
     const showTab = new Set(rows.map((r) => r.a.tab)).size > 1;
     const heights = rows.map(({ a, s }) => this.shape(a, s, busy, showTab).height + 8);
@@ -827,7 +870,7 @@ export default class Todos extends View {
         ),
       )
       .when(Boolean(empty), (el) => el.child(div().flex_1()))
-      .child(legend(t, [["↑↓", "Select"], ["Enter", "Go to session"], ["Tab", "Next"], ["−", "Collapse"], ["Esc", "Back"]]))
+      .child(legend(t, [["↑↓", "Select"], ["Enter", "Go to session"], ["Tab", "Next"], ["−", "Collapse"], ...parts.legend, ["Esc", "Back"]]))
       .child(
         v_flex()
           .flex_none()

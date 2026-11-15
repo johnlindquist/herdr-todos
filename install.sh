@@ -7,7 +7,7 @@ command -v node >/dev/null 2>&1 || { echo "install: node was not found on your P
 src="$(cd "$(dirname "$0")" && pwd)"
 mods="${HERDR_APP_HOME:-$HOME/.config/herdr-app}/mods"
 mkdir -p "$mods/todos/icons" "$mods/todos-menu"
-cp "$src"/main.js "$src"/nav.js "$src"/todos.mjs "$src"/mod.json "$mods/todos/"
+cp "$src"/main.js "$src"/nav.js "$src"/frame.js "$src"/todos.mjs "$src"/mod.json "$mods/todos/"
 cp "$src"/icons/*.svg "$mods/todos/icons/"
 cp "$src"/menu/main.js "$src"/menu/mod.json "$mods/todos-menu/"
 herdr-app check "$mods/todos"

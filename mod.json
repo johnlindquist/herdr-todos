@@ -1,1 +1,1 @@
-{ "place": "right", "size": 304, "title": "Todos", "focusable": true }
+{ "place": "right", "size": 304, "title": "Todos", "focusable": true, "overlay": { "kind": "window", "key": "todos", "keep": true, "width": 360, "height": 560 } }
