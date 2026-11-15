@@ -45,8 +45,30 @@ function parseArgs(argv) {
 
 const args = parseArgs(process.argv.slice(2));
 const stateDir = path.resolve(expandHome(typeof args.state === "string" ? args.state : "~/.cache/herdr-todos"));
-const model = typeof args.model === "string" ? args.model : process.env.HERDR_TODOS_MODEL || DEFAULT_MODEL;
-const composeModel = process.env.HERDR_TODOS_COMPOSE_MODEL || DEFAULT_COMPOSE_MODEL;
+// Model choices: --model, then the environment, then the settings file, then the defaults. The
+// settings file exists because the Herdr app starts this helper, and an app opened from the Dock
+// has no shell environment: {"model": "provider/id", "compose_model": "provider/id", "model_cmd": ["cmd", "arg"]}.
+const SETTINGS_FILE = expandHome(process.env.HERDR_TODOS_CONFIG || "~/.config/herdr-todos/config.json");
+function readSettings() {
+  let raw;
+  try {
+    raw = fsSync.readFileSync(SETTINGS_FILE, "utf8");
+  } catch {
+    return {};
+  }
+  try {
+    const v = JSON.parse(raw);
+    if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error("it must be a JSON object");
+    return v;
+  } catch (e) {
+    return fail("INVALID_CONFIG", `${SETTINGS_FILE} can't be read: ${e.message}`);
+  }
+}
+const settings = readSettings();
+const setting = (key) => (typeof settings[key] === "string" && settings[key].trim() ? settings[key].trim() : null);
+const model = typeof args.model === "string" ? args.model : process.env.HERDR_TODOS_MODEL || setting("model") || DEFAULT_MODEL;
+const composeModel = process.env.HERDR_TODOS_COMPOSE_MODEL || setting("compose_model") || DEFAULT_COMPOSE_MODEL;
+const modelCmd = process.env.HERDR_TODOS_MODEL_CMD || (Array.isArray(settings.model_cmd) ? JSON.stringify(settings.model_cmd) : null);
 const piAgentDir = expandHome(process.env.PI_CODING_AGENT_DIR || "~/.pi/agent");
 
 function expandHome(p) {
@@ -88,7 +110,7 @@ function run(cmd, argv, { input, timeout = 30_000, env } = {}) {
 // context files. HERDR_TODOS_MODEL_CMD (a JSON argv array) replaces Pi with another command: it
 // gets {"model", "system", "input"} as JSON on stdin and prints the model's reply on stdout.
 async function callModel({ model: m, system, input, timeout = 90_000 }) {
-  const custom = process.env.HERDR_TODOS_MODEL_CMD;
+  const custom = modelCmd;
   let r;
   if (custom) {
     let argv;
@@ -97,7 +119,7 @@ async function callModel({ model: m, system, input, timeout = 90_000 }) {
     } catch {
       argv = null;
     }
-    if (!Array.isArray(argv) || !argv.length || argv.some((x) => typeof x !== "string")) throw new Error("HERDR_TODOS_MODEL_CMD must be a JSON array of strings");
+    if (!Array.isArray(argv) || !argv.length || argv.some((x) => typeof x !== "string")) throw new Error("HERDR_TODOS_MODEL_CMD (or model_cmd in the settings file) must be a JSON array of strings");
     r = await run(argv[0], argv.slice(1), { input: JSON.stringify({ model: m, system, input }), timeout });
   } else {
     r = await run(
@@ -1099,8 +1121,10 @@ const DESCRIBE = {
     HERDR_TODOS_MODEL: "model for task lists and memory suggestions (default anthropic/claude-haiku-4-5)",
     HERDR_TODOS_COMPOSE_MODEL: "model that rewrites MEMORIES.md (default anthropic/claude-sonnet-5-5; falls back to HERDR_TODOS_MODEL)",
     HERDR_TODOS_MODEL_CMD: 'JSON argv array run instead of Pi for every model call; gets {"model","system","input"} as JSON on stdin, prints the reply',
+    HERDR_TODOS_CONFIG: 'settings file (default ~/.config/herdr-todos/config.json): {"model", "compose_model", "model_cmd"}; the environment wins over it',
   },
-  model_cmd: process.env.HERDR_TODOS_MODEL_CMD ?? null,
+  model_cmd: modelCmd,
+  settings_file: SETTINGS_FILE,
 };
 
 const cmd = args._[0];

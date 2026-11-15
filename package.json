@@ -1,6 +1,12 @@
 {
   "name": "herdr-todos",
-  "private": true,
+  "version": "0.1.0",
+  "description": "Todos and Memories: two sidebar widgets for the Herdr app. Todos keeps a task list per Pi conversation; Memories suggests rules from your prompts and keeps the ones you choose in MEMORIES.md.",
+  "license": "MIT",
+  "author": "John Lindquist",
+  "repository": { "type": "git", "url": "git+https://github.com/johnlindquist/herdr-todos.git" },
   "type": "module",
-  "scripts": { "check": "sh fence.sh", "test": "node --test test/*.test.mjs" }
+  "engines": { "node": ">=22" },
+  "scripts": { "check": "sh fence.sh", "test": "node --test test/*.test.mjs" },
+  "devDependencies": { "typescript": "^5.9.3" }
 }
