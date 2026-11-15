@@ -1,5 +1,6 @@
-// The right-click menu for Todos and Memories. Opened as a popup by either view with
-// props { owner: "todos" | "memories", title?, items: [{ label, icon, action, args, sep?, danger? }] }.
+// The right-click menu of a sidebar widget (the same file in herdr-todos and herdr-memories, each
+// installed under its own name: todos-menu, memories-menu). Opened as a popup by the widget with
+// props { owner: "<widget>", title?, items: [{ label, icon, action, args, sep?, danger? }] }.
 // Choosing an item closes the menu and hands { action, args } back to its owner: shared
 // "<owner>.menu", then the "<owner>.menu" command, which the owner reads in nextCommand().
 // ↑/↓ move, Enter chooses, Esc closes.
@@ -8,7 +9,7 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { props, closeOverlay, theme, run, setShared } from "herdr";
 
-export default class TodosMenu extends View {
+export default class WidgetMenu extends View {
   init(_props, cx) {
     this.at = 0;
     this.handle = cx.focus_handle();
@@ -34,7 +35,7 @@ export default class TodosMenu extends View {
     const p = props() ?? {};
     const list = this.items();
     return v_flex()
-      .id("todos-menu")
+      .id("widget-menu")
       .track_focus(this.handle)
       .w_full()
       .min_h(0)

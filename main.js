@@ -17,7 +17,7 @@ const stateDir = () => {
   return `${home()}/.cache/herdr-todos/${key}`;
 };
 // Spaces on another machine ("m1/sp…") are read there: the helper is piped through herdr-core to
-// that machine's Node, so its Pi journals, git roots, model logins and MEMORIES.md stay on it and
+// that machine's Node, so its Pi journals, git roots and model logins stay on it and
 // both ends always run this same version of the helper.
 const REMOTE_STATE = "~/.cache/herdr-todos/remote";
 const where = (space) => {
@@ -321,7 +321,7 @@ export default class Todos extends View {
         this.errors[space] = String(e?.message ?? e);
       }
       this.lastRun[space] = Date.now();
-      // Memories (the panel below) reads suggestions this refresh may have added.
+      // The Memories widget, when it is installed too, takes this as a cue to look for new prompts.
       setShared("todos.updated", { ...(shared("todos.updated") ?? {}), [space]: Date.now() });
       this.busy.delete(space);
       if (this.again.delete(space)) this.refresh(space, cx, false);
@@ -672,7 +672,7 @@ export default class Todos extends View {
           .when(needsYou, (el) =>
             el.child(div().flex_none().px(6).py(1).rounded(6).bg(t.blocked).text_color(t.background).text_size(10.5).font_medium().child("Needs you")),
           )
-          .when(Boolean(sourceIcon), (el) => el.child(div().id(`${key}-src`).tooltip(s.source === "board" ? "From this session's todo board" : "Summarized by Haiku").child(sourceIcon)))
+          .when(Boolean(sourceIcon), (el) => el.child(div().id(`${key}-src`).tooltip(s.source === "board" ? "From this session's todo board" : `Summarized by ${String(s.model ?? "a small model").split("/").pop()}. Change it: node todos.mjs config set model <provider/id>`).child(sourceIcon)))
           .when(Boolean(s?.summarized_at), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(ago(s.summarized_at)))),
       )
       .when(Boolean(tabLabel), (el) => el.child(div().mt(-4).pl(16).truncate().text_size(11).text_color(t.dim).child(tabLabel)))
@@ -837,6 +837,7 @@ export default class Todos extends View {
           .border_t(1)
           .border_color(t.border)
           .when(Boolean(error), (el) => el.child(div().text_size(11).text_color(t.blocked).child(`Update failed: ${error}`)))
+          .when(!error && Boolean(doc?.settings_problems?.length), (el) => el.child(div().text_size(11).text_color(t.blocked).child(`Settings: ${(doc?.settings_problems ?? []).join(" · ")}`)))
           .child(
             h_flex()
               .gap(6)
@@ -844,7 +845,7 @@ export default class Todos extends View {
               .text_size(11)
               .text_color(t.dim)
               .child(div().flex_1().truncate().child(footerText))
-              .child(div().flex_none().child(doc?.model ? String(doc.model).split("/").pop().replace(/^claude-/, "") : "")),
+              .child(div().id("todos-model").flex_none().tooltip(`Task lists by ${doc?.model ?? "the model in the settings"}. Change it: node todos.mjs config set model <provider/id>`).child(doc?.model ? String(doc.model).split("/").pop().replace(/^claude-/, "") : "")),
           ),
       );
   }

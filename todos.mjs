@@ -1,26 +1,39 @@
 #!/usr/bin/env node
 // Todos for a Herdr space: finds the Pi sessions running in that space, reads their journals and
 // keeps a short task list per session. Task boards written by Pi's `todo` tool are read as-is;
-// other sessions are summarized by a small model (Haiku by default) when their journal changes.
+// other sessions are summarized by a small model when their journal changes.
 //
 //   node todos.mjs refresh --space <id> [--state <dir>] [--model <provider/id>] [--force]
 //   node todos.mjs show    --space <id> [--state <dir>]
+//   node todos.mjs config | config set <key> <value> [--project] | config path
 //   node todos.mjs describe
 //
 // stdout is one JSON document. Errors print JSON to stderr and exit 1.
 
-import { execFile, spawn } from "node:child_process";
+const WIDGET = "todos";
+const VERSION = 1;
+// The settings: one schema for the settings files, `config set`, `describe` and the environment.
+const SETTINGS = {
+  model: { type: "model", default: "anthropic/claude-haiku-5-5", meaning: "The small model that writes each task list (provider/id from `pi --list-models`)." },
+  thinking: { type: "enum", values: ["off", "low", "medium", "high"], default: "off", meaning: "Thinking level passed to the model." },
+  refreshSeconds: { type: "integer", min: 15, max: 3600, default: 120, meaning: "A session that is still working gets its list rewritten at most this often." },
+  maxTasksShown: { type: "integer", min: 1, max: 20, default: 8, meaning: "The most tasks kept per session from the model's list." },
+  modelCmd: { type: "argv", default: null, meaning: 'A command run instead of Pi for every model call, as a JSON array; it gets {"model","system","input","thinking"} as JSON on stdin and prints the reply.' },
+};
+const LEGACY_KEYS = { model_cmd: "modelCmd" }; // earlier names in the settings file
+const LEGACY_ENV = {}; // HERDR_TODOS_MODEL and HERDR_TODOS_MODEL_CMD keep their names
+
+// >>> shared block: the same, byte for byte, in herdr-todos/todos.mjs and herdr-memories/memories.mjs
+// (test/shared.test.mjs compares them). It is in this file, not a module beside it, because for a
+// space on another machine the whole helper is piped to that machine's Node as one file.
+// It uses the constants above it: WIDGET, VERSION, SETTINGS, LEGACY_KEYS, LEGACY_ENV.
+
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const VERSION = 1;
-const DEFAULT_MODEL = "anthropic/claude-haiku-4-5";
-// Rewriting MEMORIES.md happens only when a memory is kept, edited or removed, and its wording is
-// read by every future agent: worth a stronger model. Falls back to the summary model.
-const DEFAULT_COMPOSE_MODEL = "anthropic/claude-sonnet-5-5";
-const WORKING_RESUMMARY_MS = 120_000; // a session still working is summarized at most this often
 const RECENT_FILE_DAYS = 21;
 const MAX_FILES_PER_DIR = 80;
 const TAIL_BYTES = 768 * 1024;
@@ -44,31 +57,7 @@ function parseArgs(argv) {
 }
 
 const args = parseArgs(process.argv.slice(2));
-const stateDir = path.resolve(expandHome(typeof args.state === "string" ? args.state : "~/.cache/herdr-todos"));
-// Model choices: --model, then the environment, then the settings file, then the defaults. The
-// settings file exists because the Herdr app starts this helper, and an app opened from the Dock
-// has no shell environment: {"model": "provider/id", "compose_model": "provider/id", "model_cmd": ["cmd", "arg"]}.
-const SETTINGS_FILE = expandHome(process.env.HERDR_TODOS_CONFIG || "~/.config/herdr-todos/config.json");
-function readSettings() {
-  let raw;
-  try {
-    raw = fsSync.readFileSync(SETTINGS_FILE, "utf8");
-  } catch {
-    return {};
-  }
-  try {
-    const v = JSON.parse(raw);
-    if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error("it must be a JSON object");
-    return v;
-  } catch (e) {
-    return fail("INVALID_CONFIG", `${SETTINGS_FILE} can't be read: ${e.message}`);
-  }
-}
-const settings = readSettings();
-const setting = (key) => (typeof settings[key] === "string" && settings[key].trim() ? settings[key].trim() : null);
-const model = typeof args.model === "string" ? args.model : process.env.HERDR_TODOS_MODEL || setting("model") || DEFAULT_MODEL;
-const composeModel = process.env.HERDR_TODOS_COMPOSE_MODEL || setting("compose_model") || DEFAULT_COMPOSE_MODEL;
-const modelCmd = process.env.HERDR_TODOS_MODEL_CMD || (Array.isArray(settings.model_cmd) ? JSON.stringify(settings.model_cmd) : null);
+const stateDir = path.resolve(expandHome(typeof args.state === "string" ? args.state : `~/.cache/herdr-${WIDGET}`));
 const piAgentDir = expandHome(process.env.PI_CODING_AGENT_DIR || "~/.pi/agent");
 
 function expandHome(p) {
@@ -78,6 +67,176 @@ function expandHome(p) {
 function fail(code, message, extra = {}) {
   process.stderr.write(JSON.stringify({ error: code, message, ...extra }) + "\n");
   process.exit(1);
+}
+
+const print = (value) => process.stdout.write(JSON.stringify(value) + "\n");
+
+// ---------- settings ----------
+// defaults < user file (~/.config/herdr-<widget>/config.json) < project file
+// (<project>/.herdr/<widget>.json) < environment (HERDR_<WIDGET>_<KEY>). The file is the main way:
+// the Herdr app starts this helper, and an app opened from the Dock has no shell environment.
+// SETTINGS (above) is the one schema: the file reader, `config set` and `describe` all use it.
+
+const ENV_PREFIX = `HERDR_${WIDGET.toUpperCase()}_`;
+const envName = (key) => ENV_PREFIX + key.replace(/[A-Z]/g, (c) => `_${c}`).toUpperCase();
+const userSettingsFile = () => path.resolve(expandHome(process.env[`${ENV_PREFIX}CONFIG`] || `~/.config/herdr-${WIDGET}/config.json`));
+const projectSettingsFile = (root) => path.join(root, ".herdr", `${WIDGET}.json`);
+
+// The cleaned value, or an Error that says what is allowed.
+function checkSetting(key, value) {
+  const spec = SETTINGS[key];
+  if (!spec) throw new Error(`unknown key "${key}" (the keys are: ${Object.keys(SETTINGS).join(", ")})`);
+  if (spec.type === "integer") {
+    const n = typeof value === "string" && /^-?\d+$/.test(value.trim()) ? Number(value) : value;
+    if (!Number.isInteger(n) || n < spec.min || n > spec.max) throw new Error(`${key} must be a whole number from ${spec.min} to ${spec.max}`);
+    return n;
+  }
+  if (spec.type === "argv") {
+    let v = value;
+    if (typeof v === "string") {
+      try {
+        v = JSON.parse(v);
+      } catch {
+        v = null;
+      }
+    }
+    if (!Array.isArray(v) || !v.length || v.some((x) => typeof x !== "string" || !x)) throw new Error(`${key} must be a JSON array of strings, like ["node","model.mjs"]`);
+    return v;
+  }
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${key} must be text`);
+  const s = value.trim();
+  if (spec.type === "enum" && !spec.values.includes(s)) throw new Error(`${key} must be one of: ${spec.values.join(", ")}`);
+  if (spec.type === "model" && !/^[^/\s]+\/\S+$/.test(s)) throw new Error(`${key} must be provider/id, like ${SETTINGS.model.default} (list them with: pi --list-models)`);
+  if (spec.type === "filename" && (/[/\\]/.test(s) || s.startsWith("."))) throw new Error(`${key} must be a file name in the project folder, like ${spec.default}`);
+  return s;
+}
+
+// A missing file is no settings. A broken file, an unknown key or a bad value is a named problem;
+// the other values still count and the defaults fill the rest.
+function readSettingsFile(file, problems) {
+  let raw;
+  try {
+    raw = fsSync.readFileSync(file, "utf8");
+  } catch {
+    return {};
+  }
+  let doc;
+  try {
+    doc = JSON.parse(raw);
+    if (!doc || typeof doc !== "object" || Array.isArray(doc)) throw new Error("it must be a JSON object");
+  } catch (e) {
+    problems.push({ error: "INVALID_CONFIG", file, message: `${file} can't be read (${e.message}); the defaults are used` });
+    return {};
+  }
+  const out = {};
+  for (const [name, value] of Object.entries(doc)) {
+    const key = LEGACY_KEYS[name] ?? name;
+    try {
+      out[key] = checkSetting(key, value);
+    } catch (e) {
+      problems.push({ error: SETTINGS[key] ? "INVALID_VALUE" : "UNKNOWN_KEY", file, key: name, message: `${file}: ${e.message}` });
+    }
+  }
+  return out;
+}
+
+const settingsCache = new Map();
+// The settings in force for a project folder (or for no project): { values, sources, files, problems }.
+function settingsFor(root = null) {
+  const id = root ?? "";
+  if (settingsCache.has(id)) return settingsCache.get(id);
+  const problems = [];
+  const values = {};
+  const sources = {};
+  for (const [key, spec] of Object.entries(SETTINGS)) {
+    values[key] = spec.default;
+    sources[key] = "default";
+  }
+  const layer = (found, source) => {
+    for (const [key, value] of Object.entries(found)) {
+      values[key] = value;
+      sources[key] = source;
+    }
+  };
+  const files = { user: userSettingsFile(), project: root ? projectSettingsFile(root) : null };
+  layer(readSettingsFile(files.user, problems), "user file");
+  if (files.project) layer(readSettingsFile(files.project, problems), "project file");
+  for (const key of Object.keys(SETTINGS)) {
+    // An older variable name first, so the current name wins when both are set.
+    for (const name of [...(LEGACY_ENV[key] ?? []), envName(key)]) {
+      const raw = process.env[name];
+      if (raw == null || raw === "") continue;
+      try {
+        values[key] = checkSetting(key, raw);
+        sources[key] = `environment (${name})`;
+      } catch (e) {
+        problems.push({ error: "INVALID_VALUE", key, message: `${name}: ${e.message}` });
+      }
+    }
+  }
+  if (typeof args.model === "string") {
+    try {
+      values.model = checkSetting("model", args.model);
+      sources.model = "--model";
+    } catch (e) {
+      problems.push({ error: "INVALID_VALUE", key: "model", message: `--model: ${e.message}` });
+    }
+  }
+  const found = { values, sources, files, problems };
+  settingsCache.set(id, found);
+  return found;
+}
+
+const describeSettings = () => Object.fromEntries(Object.entries(SETTINGS).map(([key, spec]) => [key, { ...spec, environment: [envName(key), ...(LEGACY_ENV[key] ?? [])] }]));
+
+// config | config path | config set <key> <value> [--project [folder]] | config unset <key> [--project [folder]]
+async function configCommand() {
+  const sub = args._[1];
+  const named = typeof args.project === "string" ? path.resolve(expandHome(args.project)) : null;
+  const project = named ?? (await gitRoot(process.cwd(), {})) ?? (args.project ? process.cwd() : null);
+  if (sub === "path") return print({ user: userSettingsFile(), project: project ? projectSettingsFile(project) : null });
+  let changed = null;
+  if (sub === "set" || sub === "unset") {
+    const key = args._[2];
+    if (!key) fail("INVALID", `config ${sub} <key>${sub === "set" ? " <value>" : ""} [--project]; the keys are: ${Object.keys(SETTINGS).join(", ")}`);
+    if (!SETTINGS[key]) fail("UNKNOWN_KEY", `unknown key "${key}" (the keys are: ${Object.keys(SETTINGS).join(", ")})`);
+    let value;
+    if (sub === "set") {
+      if (args._.length < 4) fail("INVALID", `config set ${key} <value> [--project]`);
+      try {
+        value = checkSetting(key, args._.slice(3).join(" "));
+      } catch (e) {
+        fail("INVALID_VALUE", e.message);
+      }
+    }
+    if (args.project && !project) fail("INVALID", "--project needs a project folder");
+    const file = args.project ? projectSettingsFile(project) : userSettingsFile();
+    let doc = {};
+    const raw = await fs.readFile(file, "utf8").catch(() => null);
+    if (raw != null) {
+      try {
+        doc = JSON.parse(raw);
+        if (!doc || typeof doc !== "object" || Array.isArray(doc)) throw new Error("it must be a JSON object");
+      } catch (e) {
+        fail("INVALID_CONFIG", `${file} can't be read (${e.message}); fix or delete it, then set the value again`);
+      }
+    }
+    for (const [old, now] of Object.entries(LEGACY_KEYS)) if (now === key) delete doc[old];
+    if (sub === "set") doc[key] = value;
+    else delete doc[key];
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, JSON.stringify(doc, null, 2) + "\n");
+    settingsCache.clear();
+    changed = { file, key, ...(sub === "set" ? { value } : { removed: true }) };
+  } else if (sub !== undefined) fail("INVALID", "config | config path | config set <key> <value> [--project] | config unset <key> [--project]");
+  const s = settingsFor(project);
+  print({
+    widget: WIDGET,
+    ...(changed ? { changed } : {}),
+    settings: Object.fromEntries(Object.keys(SETTINGS).map((key) => [key, { value: s.values[key], from: s.sources[key] }])),
+    files: s.files,
+    problems: s.problems,
+  });
 }
 
 // ---------- small io helpers ----------
@@ -107,28 +266,22 @@ function run(cmd, argv, { input, timeout = 30_000, env } = {}) {
 }
 
 // Every model call goes through here. Default: Pi in print mode with no tools, extensions or
-// context files. HERDR_TODOS_MODEL_CMD (a JSON argv array) replaces Pi with another command: it
-// gets {"model", "system", "input"} as JSON on stdin and prints the model's reply on stdout.
-async function callModel({ model: m, system, input, timeout = 90_000 }) {
-  const custom = modelCmd;
-  let r;
-  if (custom) {
-    let argv;
-    try {
-      argv = JSON.parse(custom);
-    } catch {
-      argv = null;
-    }
-    if (!Array.isArray(argv) || !argv.length || argv.some((x) => typeof x !== "string")) throw new Error("HERDR_TODOS_MODEL_CMD (or model_cmd in the settings file) must be a JSON array of strings");
-    r = await run(argv[0], argv.slice(1), { input: JSON.stringify({ model: m, system, input }), timeout });
-  } else {
-    r = await run(
-      "pi",
-      ["-p", "--no-session", "-ne", "-nt", "-ns", "-np", "-nc", "--no-mcp", "--no-themes", "--thinking", "off", "--model", m, "--system-prompt", system],
-      { input, timeout, env: { ...process.env, PI_NO_TITLE: "1" } },
-    );
+// context files. The modelCmd setting (an argv array) replaces Pi with another command: it gets
+// {"model", "system", "input", "thinking"} as JSON on stdin and prints the model's reply on stdout.
+// A failure names the model and how to change it.
+async function callModel({ model, system, input, settings, timeout = 90_000 }) {
+  const { thinking, modelCmd } = settings.values;
+  const r = modelCmd
+    ? await run(modelCmd[0], modelCmd.slice(1), { input: JSON.stringify({ model, system, input, thinking }), timeout })
+    : await run(
+        "pi",
+        ["-p", "--no-session", "-ne", "-nt", "-ns", "-np", "-nc", "--no-mcp", "--no-themes", "--thinking", thinking, "--model", model, "--system-prompt", system],
+        { input, timeout, env: { ...process.env, PI_NO_TITLE: "1" } },
+      );
+  if (r.code !== 0) {
+    const why = (r.stderr.trim().split("\n").pop() || `exit ${r.code}`).slice(0, 160);
+    throw new Error(`${modelCmd ? `${modelCmd[0]} (modelCmd)` : model} failed: ${why}. Another model: node ${WIDGET}.mjs config set model <provider/id>`);
   }
-  if (r.code !== 0) throw new Error((r.stderr.trim().split("\n").pop() || `model command exited ${r.code}`).slice(0, 200));
   return r.stdout;
 }
 
@@ -166,33 +319,46 @@ async function pool(items, limit, fn) {
   return results;
 }
 
-const spaceFile = (space) => path.join(stateDir, "spaces", `${space.replace(/[^A-Za-z0-9_-]/g, "_")}.json`);
 const indexFile = () => path.join(stateDir, "index.json");
-const prefsFile = (space) => path.join(stateDir, "prefs", `${space.replace(/[^A-Za-z0-9_-]/g, "_")}.json`);
-const LEVELS = ["high", "normal", "low"];
-
-// The person's choices for a space: session order (terminal addresses, first = most important)
-// and task priorities keyed "<terminal>|<task key>".
-async function readPrefs(space) {
-  const p = await readJson(prefsFile(space), {});
-  return { order: Array.isArray(p.order) ? p.order.filter((x) => typeof x === "string") : [], priority: p.priority && typeof p.priority === "object" ? p.priority : {} };
+const readIndex = () => readJson(indexFile(), { version: VERSION, files: {} });
+// Merges with the index another run may have written meanwhile.
+async function saveIndex(index) {
+  const latest = await readIndex();
+  for (const [f, v] of Object.entries(index.files)) if (!latest.files[f] || latest.files[f].offset <= v.offset) latest.files[f] = v;
+  latest.roots = { ...(latest.roots ?? {}), ...(index.roots ?? {}) };
+  await writeJsonAtomic(indexFile(), latest);
 }
 
-// Stable identity for a task: a board task's id, else its words.
-const taskKey = (t) => (t.id != null ? `#${t.id}` : t.text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim());
+async function gitRoot(cwd, cache) {
+  if (cache[cwd] !== undefined) return cache[cwd];
+  const r = await run("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { timeout: 5000 });
+  cache[cwd] = r.code === 0 ? r.stdout.trim() || null : null;
+  return cache[cwd];
+}
 
-function applyPrefs(doc, prefs) {
-  const rank = new Map(prefs.order.map((a, i) => [a, i]));
-  for (const s of doc.sessions) {
-    s.tasks = (s.tasks ?? []).map((t) => {
-      const key = taskKey(t);
-      const level = prefs.priority[`${s.terminal}|${key}`];
-      return { ...t, key, priority: LEVELS.includes(level) ? level : "normal" };
-    });
-    s.rank = rank.has(s.terminal) ? rank.get(s.terminal) : null;
+async function withLock(space, fn) {
+  const lock = path.join(stateDir, "locks", `${space.replace(/[^A-Za-z0-9_-]/g, "_")}.lock`);
+  await fs.mkdir(path.dirname(lock), { recursive: true });
+  try {
+    const fh = await fs.open(lock, "wx");
+    await fh.write(String(process.pid));
+    await fh.close();
+  } catch {
+    const pid = Number(await fs.readFile(lock, "utf8").catch(() => "0"));
+    const st = await fs.stat(lock).catch(() => null);
+    let alive = false;
+    try {
+      if (pid) process.kill(pid, 0), (alive = true);
+    } catch {}
+    if (alive && st && Date.now() - st.mtimeMs < 5 * 60_000) return null;
+    await fs.rm(lock, { force: true });
+    return withLock(space, fn);
   }
-  doc.prefs = prefs;
-  return doc;
+  try {
+    return await fn();
+  } finally {
+    await fs.rm(lock, { force: true });
+  }
 }
 
 // ---------- Pi session journals ----------
@@ -471,75 +637,9 @@ async function mapTerminals(terms, index, previous) {
   return result;
 }
 
-// ---------- summaries ----------
+// ---------- a new Pi beside a session ----------
 
-const SYSTEM = `You keep a glanceable task list for one coding-agent session that a person checks between other work.
-Return JSON only, no markdown:
-{"title": string, "now": string, "tasks": [{"text": string, "status": "in_progress" | "todo" | "done" | "blocked"}]}
-- title: 2-5 words naming what this session is about.
-- now: at most 80 characters. While working: what the agent is doing. Otherwise: the outcome, or what the person should do next. Plain words; never "Session complete" or "Done.".
-- tasks: 1-6 items the person asked for or the agent committed to. Outcomes, not individual tool calls. At most 60 characters each, starting with a verb.
-- Reuse the wording of previous tasks that still apply and update their status, so the list stays stable between updates. A previous task with a "priority" was ranked by the person: keep its text exactly, character for character, and keep it in the list until it is done.
-- "done" only when the conversation shows the work finished. "blocked" when it waits on the person: a question, an approval, a decision, a missing login. "in_progress" for what is being worked on now. "todo" for agreed work not started.
-- Keep at most 3 done tasks: the most recent ones. Order: blocked, in_progress, todo, done.
-- If the agent's status is "working", the newest request is not finished yet.`;
-
-function parseModelJson(text) {
-  const cleaned = text.replace(/```(?:json)?/g, "");
-  const a = cleaned.indexOf("{");
-  const b = cleaned.lastIndexOf("}");
-  if (a < 0 || b <= a) throw new Error("model reply had no JSON object");
-  const v = JSON.parse(cleaned.slice(a, b + 1));
-  const STATUSES = ["in_progress", "todo", "done", "blocked"];
-  const tasks = Array.isArray(v.tasks) ? v.tasks : [];
-  return {
-    title: String(v.title ?? "").slice(0, 60).trim() || null,
-    now: String(v.now ?? "").slice(0, 120).trim() || null,
-    tasks: tasks
-      .filter((t) => t && typeof t.text === "string" && t.text.trim())
-      .slice(0, 8)
-      .map((t) => ({ text: t.text.trim().slice(0, 90), status: STATUSES.includes(t.status) ? t.status : "todo" })),
-  };
-}
-
-async function summarize({ status, name, cwd, first, conversation, previous }) {
-  const payload = {
-    agent_status: status,
-    session_name: name,
-    folder: cwd,
-    first_request: first,
-    previous: previous ? { title: previous.title, now: previous.now, tasks: (previous.tasks ?? []).map((t) => ({ text: t.text, status: t.status, ...(t.priority && t.priority !== "normal" ? { priority: t.priority } : {}) })) } : null,
-    conversation,
-  };
-  const prompt = `Session data:\n${JSON.stringify(payload)}\n\nReturn the JSON task list now.`;
-  return parseModelJson(await callModel({ model, system: SYSTEM, input: prompt }));
-}
-
-function boardTasks(board) {
-  const MAP = { pending: "todo", in_progress: "in_progress", completed: "done" };
-  const live = board.filter((t) => MAP[t.status]);
-  const open = live.filter((t) => t.status !== "completed");
-  const done = live.filter((t) => t.status === "completed").slice(-3);
-  const order = { in_progress: 0, todo: 1, done: 2 };
-  return [...open, ...done]
-    .map((t) => ({ id: t.id, text: t.status === "in_progress" && t.activeForm ? t.activeForm : t.subject, status: MAP[t.status] }))
-    .sort((a, b) => order[a.status] - order[b.status]);
-}
-
-// ---------- memories ----------
-// Candidate guidance from the person's own messages, kept per project (git root) until the person
-// keeps or dismisses it. Kept ones are rewritten together into <root>/MEMORIES.md whenever one is
-// added, removed or edited: merged, grouped and as terse as their meaning allows. The store keeps
-// which memories each line came from; <root>/AGENTS.md links to the file.
-
-const MEMORY_FILE = "MEMORIES.md";
-const LEGACY_FILE = "memories.md";
-const MEMORY_HEADER = "# Memories\n\nStanding decisions for this project. A request can override them.\n";
-const AGENTS_LINK = "Read [MEMORIES.md](MEMORIES.md) first: standing decisions for this project.";
-const LEGACY_LINKS = [
-  "Read [memories.md](memories.md) before you start: decisions and preferences from earlier work in this project. Follow them unless the current request says otherwise.",
-];
-const MAX_NEW_FIRST_SIGHT = 2; // a session seen for the first time: only its latest prompts
+// Messages the widgets and the harness put into a conversation: never the person's own words.
 const INJECTED = [
   /^The conversation history above was just compacted/,
   /^Provider retry activated/,
@@ -550,455 +650,6 @@ const INJECTED = [
   /^\s*</,
   /^\[(?:subagent|hub|system|automated)/i,
 ];
-
-const memStoreFile = (root) => path.join(stateDir, "memories", `${root.replace(/[^A-Za-z0-9_-]/g, "_")}.json`);
-const norm = (t) => t.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
-const newId = () => Math.random().toString(36).slice(2, 10);
-const marker = (id) => `<!-- memory:${id} -->`; // the first format: one marked line per memory
-const hash = (t) => {
-  let h = 0;
-  for (let i = 0; i < t.length; i++) h = (Math.imul(h, 31) + t.charCodeAt(i)) | 0;
-  return String(h >>> 0);
-};
-
-async function gitRoot(cwd, cache) {
-  if (cache[cwd] !== undefined) return cache[cwd];
-  const r = await run("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { timeout: 5000 });
-  cache[cwd] = r.code === 0 ? r.stdout.trim() || null : null;
-  return cache[cwd];
-}
-
-// Waits for the lock instead of skipping: memory writes must not be lost.
-async function withWaitLock(name, fn) {
-  const deadline = Date.now() + 15_000;
-  for (;;) {
-    const r = await withLock(name, async () => ({ value: await fn() }));
-    if (r) return r.value;
-    if (Date.now() > deadline) throw new Error("memories are busy; try again");
-    await new Promise((res) => setTimeout(res, 150));
-  }
-}
-
-async function readStore(root) {
-  const s = await readJson(memStoreFile(root), null);
-  return s && Array.isArray(s.items) ? s : { version: VERSION, root, items: [], processed: {} };
-}
-
-async function readMemoryFile(root) {
-  return fs.readFile(path.join(root, MEMORY_FILE), "utf8").catch(() => null);
-}
-
-// memories.md -> MEMORIES.md (also on case-insensitive disks, where both names are one file).
-async function migrateName(root) {
-  const names = await fs.readdir(root).catch(() => []);
-  if (names.includes(LEGACY_FILE) && !names.includes(MEMORY_FILE)) {
-    const tmp = path.join(root, `.MEMORIES.md.${process.pid}`);
-    await fs.rename(path.join(root, LEGACY_FILE), tmp);
-    await fs.rename(tmp, path.join(root, MEMORY_FILE));
-  }
-  const agents = path.join(root, "AGENTS.md");
-  const body = await fs.readFile(agents, "utf8").catch(() => null);
-  if (body != null) {
-    let next = body;
-    for (const old of LEGACY_LINKS) next = next.split(old).join(AGENTS_LINK);
-    // Two old links (one per earlier writer) become one.
-    const twice = `${AGENTS_LINK}\n\n${AGENTS_LINK}`;
-    while (next.includes(twice)) next = next.replace(twice, AGENTS_LINK);
-    if (next !== body) await fs.writeFile(agents, next);
-  }
-}
-
-async function ensureAgentsLink(root) {
-  const file = path.join(root, "AGENTS.md");
-  const body = await fs.readFile(file, "utf8").catch(() => null);
-  if (body != null && /MEMORIES\.md/.test(body)) return;
-  const next = body == null ? `${AGENTS_LINK}\n` : `${body.replace(/\n*$/, "\n")}\n${AGENTS_LINK}\n`;
-  await fs.writeFile(file, next);
-}
-
-const bullet = (it) => `- ${it.label ? `**${it.label}:** ` : ""}${it.text}`;
-
-function renderFile(sections) {
-  const parts = [MEMORY_HEADER];
-  const headed = sections.length > 1;
-  for (const sec of sections) {
-    if (!sec.items.length) continue;
-    parts.push(`${headed ? `## ${sec.heading}\n\n` : ""}${sec.items.map(bullet).join("\n")}\n`);
-  }
-  return parts.join("\n");
-}
-
-// Brings the store up to date with the file: the first format's markers, or edits made by hand
-// since the last rewrite (a deleted line removes its memories; a new line is a kept memory).
-// Returns true when the file needs rewriting.
-async function importFile(store) {
-  await migrateName(store.root);
-  const text = await readMemoryFile(store.root);
-  const accepted = store.items.filter((m) => m.status === "accepted");
-  const now = Date.now();
-  if (!store.rendered) {
-    if (text == null) return accepted.length > 0;
-    for (const m of accepted) if (!text.includes(marker(m.id))) Object.assign(m, { status: "removed", updated_at: now });
-    return true; // first format: rewrite in the new one
-  }
-  if (text == null) {
-    for (const m of accepted) Object.assign(m, { status: "removed", updated_at: now });
-    return false;
-  }
-  if (hash(text) === store.rendered.hash) return false;
-  const lines = new Set(text.split("\n").map((l) => l.trim()).filter((l) => l.startsWith("- ")));
-  const known = new Set();
-  for (const it of store.rendered.items) {
-    const line = bullet(it);
-    known.add(line);
-    if (!lines.has(line)) for (const id of it.ids) {
-      const m = store.items.find((x) => x.id === id && x.status === "accepted");
-      if (m) Object.assign(m, { status: "removed", updated_at: now });
-    }
-  }
-  for (const line of lines) {
-    if (known.has(line)) continue;
-    const words = line.slice(2).replace(/<!--.*?-->/g, "").trim();
-    if (!words) continue;
-    store.items.push({ id: newId(), text: words.replace(/\*\*/g, ""), kind: "decision", quote: "", status: "accepted", created_at: now, updated_at: now, source: { manual: true } });
-  }
-  return true;
-}
-
-const COMPOSE_SYSTEM = `You maintain MEMORIES.md: a project's standing rules for coding agents, read at the start of every task. Every word costs attention, so rewrite the kept memories into the smallest form that keeps their full meaning.
-Return JSON only, no markdown: {"sections": [{"heading": string, "items": [{"label": string, "text": string, "ids": [string]}]}]}
-- Merge memories that overlap or serve one goal into one item and list all their ids. Every given id appears exactly once.
-- label: 1-3 words in sentence case naming the subject ("Icons", "Source of truth").
-- text: the rule, imperative, at most 80 characters. Cut filler ("make sure to", "when possible", "in order to"), reasons, and words the label already says. Keep concrete specifics: names, tools, numbers, paths. Semicolons over sentences.
-- Example. Memories: "Use VS Code Codicons (already shipped in Herdr) for icons; no font installation needed." and "Use existing open source icon libraries and fonts instead of designing custom icons." Item: {"label": "Icons", "text": "Codicons (ships with Herdr) or other open source sets; never draw custom icons"}.
-- Group by topic under 1-2 word headings, most important first. Every section needs at least 2 items: fold a lone item into the closest section. With 5 rules or fewer, use a single section.
-- Keep earlier headings, labels and wording when they still fit, so the file changes as little as possible.`;
-
-// Rewrites MEMORIES.md from every kept memory. A model groups, merges and tightens the wording;
-// code checks that every memory is still there and renders the file.
-async function compose(store) {
-  const accepted = store.items.filter((m) => m.status === "accepted");
-  const ids = new Set(accepted.map((m) => m.id));
-  let sections = null;
-  if (accepted.length) {
-    for (const m of [...new Set([composeModel, model])]) try {
-      const payload = {
-        previous: store.rendered?.sections ?? null,
-        memories: accepted.map((m) => ({ id: m.id, text: m.text, kind: m.kind })),
-      };
-      const reply = await callModel({ model: m, system: COMPOSE_SYSTEM, input: `${JSON.stringify(payload)}\n\nReturn the JSON now.` });
-      const cleaned = reply.replace(/```(?:json)?/g, "");
-      const v = JSON.parse(cleaned.slice(cleaned.indexOf("{"), cleaned.lastIndexOf("}") + 1));
-      const used = new Set();
-      sections = (v.sections ?? []).map((sec) => ({
-        heading: String(sec.heading ?? "").trim().slice(0, 40) || "Rules",
-        items: (sec.items ?? [])
-          .map((it) => ({
-            label: String(it.label ?? "").replace(/[*:]+/g, "").trim().slice(0, 40) || null,
-            text: String(it.text ?? "").replace(/\s+/g, " ").trim().slice(0, 240),
-            ids: (Array.isArray(it.ids) ? it.ids : []).filter((id) => ids.has(id) && !used.has(id) && used.add(id)),
-          }))
-          .filter((it) => it.text && it.ids.length),
-      })).filter((sec) => sec.items.length);
-      // Anything the model dropped goes back in as written.
-      const missing = accepted.filter((m) => !used.has(m.id));
-      if (missing.length) sections.push({ heading: "Other", items: missing.map((m) => ({ label: null, text: m.text, ids: [m.id] })) });
-      if (sections.length) break;
-    } catch {
-      sections = null;
-    }
-    if (!sections?.length) sections = [{ heading: "Rules", items: accepted.map((m) => ({ label: null, text: m.text, ids: [m.id] })) }];
-  } else sections = [];
-  const text = renderFile(sections);
-  await fs.writeFile(path.join(store.root, MEMORY_FILE), text);
-  if (accepted.length) await ensureAgentsLink(store.root);
-  store.rendered = { sections, items: sections.flatMap((s) => s.items), hash: hash(text), at: Date.now() };
-}
-
-const MEMORY_SYSTEM = `You read what a person typed to a coding agent and pick out lasting guidance worth adding to the project's agent instructions, so future agents follow it without being told again.
-Return JSON only, no markdown: {"memories": [{"text": string, "kind": "decision" | "preference" | "correction", "quote": string, "describes_current_request": boolean, "lasting": boolean}]}
-
-A memory is a rule for future work: it would still be true and useful a month from now, in a different task in this project.
-- decision: how this project does something. "the source of truth is the approved recording, not the script", "treat clicks as hints for the editing agent, never as destructive edits".
-- preference: what the person likes in results or process. "support light and dark mode", "use the component layout system when showing components".
-- correction: the person pushing back on something the agent did, so it doesn't happen again. Their reaction to the agent's previous reply counts.
-
-Never a memory:
-- A request, feature idea or task description, however detailed ("add a right-click menu to the sidebar", "build a todos panel"). Describing what to build now is not a rule for later.
-- Questions, approvals and nudges ("go", "yes", "please continue", "ELI5"), status reports, thanks.
-- Facts about the current bug or run.
-- Anything in the known list, even reworded. Items marked rejected were turned down: never propose them or close variants.
-
-text: one imperative sentence for a future agent, at most 160 characters. quote: the person's own words, verbatim, at most 120 characters. describes_current_request: true when the text restates what the person is asking the agent to build, change or do in this request (a feature, its behavior, its files). Those are dropped: a spec for the thing being built is not a rule for future work, even when it says "always" or describes how the feature should behave. lasting: false if it only matters for the current task; those are dropped too.
-Most messages contain no memory. An empty list is the usual answer. At most 2.`;
-
-async function proposeMemories({ messages, known }) {
-  const prompt = `Known memories:\n${JSON.stringify(known)}\n\nNew messages (the agent's previous reply, then what the person typed):\n${JSON.stringify(messages)}\n\nReturn the JSON now.`;
-  const reply = await callModel({ model, system: MEMORY_SYSTEM, input: prompt });
-  const cleaned = reply.replace(/```(?:json)?/g, "");
-  const a = cleaned.indexOf("{");
-  const b = cleaned.lastIndexOf("}");
-  if (a < 0 || b <= a) return [];
-  const v = JSON.parse(cleaned.slice(a, b + 1));
-  const KINDS = ["decision", "preference", "correction"];
-  return (Array.isArray(v.memories) ? v.memories : [])
-    .filter((m) => m && typeof m.text === "string" && m.text.trim() && m.lasting !== false && m.describes_current_request !== true)
-    .slice(0, 2)
-    .map((m) => ({ text: m.text.trim().slice(0, 220), kind: KINDS.includes(m.kind) ? m.kind : "preference", quote: String(m.quote ?? "").slice(0, 160) }));
-}
-
-// When a journal is a fork of another (its header names a parentSession), the moment it was made.
-async function forkTime(file) {
-  const fh = await fs.open(file, "r").catch(() => null);
-  if (!fh) return null;
-  try {
-    const buf = Buffer.alloc(4096);
-    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
-    const first = buf.subarray(0, bytesRead).toString("utf8").split("\n")[0];
-    const h = JSON.parse(first);
-    return h.type === "session" && h.parentSession ? Date.parse(h.timestamp) || null : null;
-  } catch {
-    return null;
-  } finally {
-    await fh.close();
-  }
-}
-
-// New prompts in a session since it was last read for memories: each with the reply before it.
-async function extractFrom(session, root) {
-  const st = await fs.stat(session.file).catch(() => null);
-  if (!st) return;
-  const peek = await readStore(root);
-  const seen = peek.processed[session.file];
-  if (seen && seen.size === st.size) return;
-  const conversation = await recentConversation(session.file);
-  // Harness notes arrive as user messages too; they never carry the person's guidance.
-  // A fork (Pi's --fork, /split, an explain pane) repeats its parent's prompts: only its own count.
-  const forkedAt = await forkTime(session.file);
-  const users = conversation.filter(
-    (m) => m.role === "user" && !INJECTED.some((re) => re.test(m.text)) && !(forkedAt && Date.parse(m.at) < forkedAt - 1000),
-  );
-  let fresh;
-  if (!seen) fresh = users.slice(-MAX_NEW_FIRST_SIGHT);
-  else {
-    const at = users.findIndex((m) => m.id === seen.user);
-    fresh = at >= 0 ? users.slice(at + 1) : users.slice(-MAX_NEW_FIRST_SIGHT);
-  }
-  const lastUser = users.at(-1)?.id ?? seen?.user ?? null;
-  let proposed = [];
-  if (fresh.length) {
-    const messages = fresh.map((u) => {
-      const i = conversation.indexOf(u);
-      const before = conversation.slice(0, i).reverse().find((m) => m.role === "assistant");
-      return { agent_before: before ? before.text.slice(-700) : null, person: u.text.slice(0, 1500), id: u.id };
-    });
-    const known = peek.items
-      .filter((m) => m.status !== "removed" || m.updated_at > Date.now() - 30 * 86400_000)
-      .slice(-80)
-      .map((m) => (m.status === "dismissed" || m.status === "removed" ? `rejected: ${m.text}` : m.text));
-    proposed = (await proposeMemories({ messages, known })).map((m) => ({ ...m, from: messages.at(-1).id }));
-  }
-  await withWaitLock(`mem-${root}`, async () => {
-    const store = await readStore(root);
-    const have = new Set(store.items.map((m) => norm(m.text)));
-    for (const m of proposed) {
-      if (have.has(norm(m.text))) continue;
-      store.items.push({
-        id: newId(),
-        text: m.text,
-        kind: m.kind,
-        quote: m.quote,
-        status: "pending",
-        created_at: Date.now(),
-        updated_at: Date.now(),
-        source: { terminal: session.terminal, session: session.name, file: session.file, entry: m.from },
-      });
-      have.add(norm(m.text));
-    }
-    store.processed[session.file] = { size: st.size, user: lastUser };
-    await writeJsonAtomic(memStoreFile(root), store);
-  });
-}
-
-async function memoriesFor(roots) {
-  const out = [];
-  for (const root of roots) {
-    const store = await withWaitLock(`mem-${root}`, async () => {
-      const s = await readStore(root);
-      if (await importFile(s)) await compose(s);
-      await writeJsonAtomic(memStoreFile(root), s);
-      return s;
-    });
-    const by = (st) => store.items.filter((m) => m.status === st);
-    out.push({
-      root,
-      name: path.basename(root),
-      file: path.join(root, MEMORY_FILE),
-      pending: by("pending").sort((a, b) => b.created_at - a.created_at),
-      // What MEMORIES.md says, line by line, with the memories behind each line.
-      kept: (store.rendered?.sections ?? []).map((sec) => ({ heading: sec.heading, items: sec.items })),
-      accepted: by("accepted").sort((a, b) => a.updated_at - b.updated_at),
-      dismissed: by("dismissed").length + by("removed").length,
-    });
-  }
-  return out;
-}
-
-// accept, dismiss, remove, restore and edit take one id or several ("a,b": a merged line).
-// Every change to what is kept rewrites MEMORIES.md.
-async function memoryAction(action, root, idArg, text) {
-  return withWaitLock(`mem-${root}`, async () => {
-    const store = await readStore(root);
-    await importFile(store);
-    let targets;
-    if (action === "add") {
-      if (!text?.trim()) fail("INVALID", "--text is required");
-      const m = { id: newId(), text: text.trim(), kind: "decision", quote: "", status: "pending", created_at: Date.now(), updated_at: Date.now(), source: { manual: true } };
-      store.items.push(m);
-      targets = [m];
-      action = "accept";
-      text = null;
-    } else {
-      const ids = String(idArg).split(",").map((x) => x.trim()).filter(Boolean);
-      targets = ids.map((id) => store.items.find((x) => x.id === id));
-      if (!targets.length || targets.some((m) => !m)) fail("NOT_FOUND", `no memory ${idArg} for ${root}`);
-    }
-    const keptBefore = targets.some((m) => m.status === "accepted");
-    if (text != null && text.trim()) {
-      // Editing a merged line: the first memory takes the new words, the rest fold into it.
-      targets[0].text = text.trim().replace(/\s+/g, " ");
-      if (keptBefore && targets.length > 1) for (const m of targets.slice(1)) m.status = "removed";
-    }
-    const STATUS = { accept: "accepted", dismiss: "dismissed", remove: "removed", restore: "pending" };
-    if (action !== "edit") {
-      if (!STATUS[action]) fail("INVALID", `unknown memory action ${action}`);
-      for (const m of targets) m.status = STATUS[action];
-    }
-    for (const m of targets) m.updated_at = Date.now();
-    if (keptBefore || action === "accept") await compose(store);
-    await writeJsonAtomic(memStoreFile(root), store);
-    return targets.length === 1 ? targets[0] : targets;
-  });
-}
-
-// ---------- commands ----------
-
-async function withLock(space, fn) {
-  const lock = path.join(stateDir, "locks", `${space.replace(/[^A-Za-z0-9_-]/g, "_")}.lock`);
-  await fs.mkdir(path.dirname(lock), { recursive: true });
-  try {
-    const fh = await fs.open(lock, "wx");
-    await fh.write(String(process.pid));
-    await fh.close();
-  } catch {
-    const pid = Number(await fs.readFile(lock, "utf8").catch(() => "0"));
-    const st = await fs.stat(lock).catch(() => null);
-    let alive = false;
-    try {
-      if (pid) process.kill(pid, 0), (alive = true);
-    } catch {}
-    if (alive && st && Date.now() - st.mtimeMs < 5 * 60_000) return null;
-    await fs.rm(lock, { force: true });
-    return withLock(space, fn);
-  }
-  try {
-    return await fn();
-  } finally {
-    await fs.rm(lock, { force: true });
-  }
-}
-
-async function refresh(space, force) {
-  const previous = await readJson(spaceFile(space), null);
-  const result = await withLock(space, async () => {
-    const index = await readJson(indexFile(), { version: VERSION, files: {} });
-    const terms = await piTerminalsIn(space);
-    const mapping = await mapTerminals(terms, index, previous);
-    const prevBy = new Map((previous?.sessions ?? []).map((s) => [s.terminal, s]));
-    const now = Date.now();
-
-    const sessions = await pool(terms, MAX_PARALLEL, async (t) => {
-      const { file, mapping: how } = mapping.get(t.address);
-      const status = statusWord(t);
-      const cwd = t.foreground?.cwd || t.cwd;
-      const prev = prevBy.get(t.address);
-      const base = {
-        terminal: t.address,
-        tab: t.labels?.["herdr.tab"] ?? null,
-        pid: t.foreground?.pid ?? null,
-        cwd,
-        status,
-        name: null,
-        file,
-        mapping: how,
-        title: null,
-        now: null,
-        tasks: [],
-        source: "none",
-        summarized_at: null,
-        fingerprint: null,
-        error: null,
-      };
-      if (!file) return { ...base, now: "Waiting for this session's first message" };
-      const info = index.files[file] ?? (await scanFile(file, await fs.stat(file), null));
-      index.files[file] = info;
-      base.name = info.name;
-      const fingerprint = `${info.size}`;
-      const same = prev && prev.file === file;
-
-      if (info.board && info.board.length) {
-        const at = Date.parse(info.boardAt ?? "") || now;
-        return { ...base, title: info.name, tasks: boardTasks(info.board), source: "board", summarized_at: at, fingerprint };
-      }
-      const fresh = same && prev.fingerprint === fingerprint && prev.status === status && prev.source === "haiku" && !prev.error;
-      const throttled = same && status === "working" && prev.status === "working" && prev.summarized_at && now - prev.summarized_at < WORKING_RESUMMARY_MS;
-      if (!force && (fresh || throttled)) return { ...prev, status, mapping: how, name: info.name, pid: base.pid, tab: base.tab };
-
-      try {
-        const conversation = await recentConversation(file);
-        if (!conversation.length) return { ...base, title: info.name, now: "No conversation yet", fingerprint };
-        const s = await summarize({ status, name: info.name, cwd, first: info.first, conversation, previous: same ? prev : null });
-        return { ...base, ...s, title: s.title || info.name, source: "haiku", summarized_at: now, fingerprint };
-      } catch (e) {
-        // Keep the last good list, say why it is stale.
-        if (same && prev.tasks?.length) return { ...prev, status, mapping: how, error: String(e.message || e).slice(0, 200) };
-        return { ...base, title: info.name, error: String(e.message || e).slice(0, 200) };
-      }
-    });
-
-    // Project roots, then memory candidates from new prompts (after the task lists, so a slow
-    // model call here never holds those back from the person).
-    index.roots = index.roots ?? {};
-    for (const sess of sessions) sess.root = sess.cwd ? await gitRoot(sess.cwd, index.roots) : null;
-    await pool(sessions.filter((x) => x.file && x.root), MAX_PARALLEL, (sess) =>
-      extractFrom(sess, sess.root).catch((e) => {
-        sess.memory_error = String(e.message || e).slice(0, 200);
-      }),
-    );
-
-    // Merge with the index another refresh may have written meanwhile.
-    const latest = await readJson(indexFile(), { version: VERSION, files: {} });
-    for (const [f, v] of Object.entries(index.files)) if (!latest.files[f] || latest.files[f].offset <= v.offset) latest.files[f] = v;
-    latest.roots = { ...(latest.roots ?? {}), ...index.roots };
-    await writeJsonAtomic(indexFile(), latest);
-
-    const doc = applyPrefs({ version: VERSION, space, model, updated_at: now, state: sessions.length ? "ready" : "empty", sessions }, await readPrefs(space));
-    await writeJsonAtomic(spaceFile(space), doc);
-    return doc;
-  });
-  if (result) return result;
-  return { ...(previous ?? { version: VERSION, space, sessions: [], updated_at: null, state: "empty" }), busy: true };
-}
-
-// ---------- explain in a split ----------
-// A right-click on a task, a session or a memory opens a new Pi beside the session it came from,
-// on a fork of that conversation (`pi --fork`: a copy; the original keeps going on its own), with
-// a first message asking it to explain. The person can then ask it to act; the prompt names the
-// commands that change the sidebar. This prints the command; the sidebar (or an agent) opens the
-// pane with `herdr-app do pane.split {pane, direction: "right", argv}`.
-
-const SPLIT_TAG = "[From the Todos sidebar]";
-const MEMORY_TAG = "[From the Memories sidebar]";
 
 function findOnPath(name) {
   for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
@@ -1028,10 +679,183 @@ function launchArgv({ folder, fork, name, prompt }) {
   if (!pi) fail("NO_PI", "pi is not on PATH here");
   const piArgv = [pi, ...(fork ? ["--fork", fork] : []), "--name", name, prompt];
   // pane.split takes argv, not a folder: cd there first, paths passed as data, never as shell source.
-  return ["/bin/sh", "-c", 'cd "$1" && shift && exec "$@"', "todos-explain", folder, "/usr/bin/env", `PATH=${process.env.PATH ?? ""}`, ...piArgv];
+  return ["/bin/sh", "-c", 'cd "$1" && shift && exec "$@"', `${WIDGET}-explain`, folder, "/usr/bin/env", `PATH=${process.env.PATH ?? ""}`, ...piArgv];
 }
 
 const short = (t, n) => (t.length > n ? `${t.slice(0, n - 1).trimEnd()}…` : t);
+// <<< shared block
+
+const spaceFile = (space) => path.join(stateDir, "spaces", `${space.replace(/[^A-Za-z0-9_-]/g, "_")}.json`);
+const prefsFile = (space) => path.join(stateDir, "prefs", `${space.replace(/[^A-Za-z0-9_-]/g, "_")}.json`);
+const LEVELS = ["high", "normal", "low"];
+
+// The person's choices for a space: session order (terminal addresses, first = most important)
+// and task priorities keyed "<terminal>|<task key>".
+async function readPrefs(space) {
+  const p = await readJson(prefsFile(space), {});
+  return { order: Array.isArray(p.order) ? p.order.filter((x) => typeof x === "string") : [], priority: p.priority && typeof p.priority === "object" ? p.priority : {} };
+}
+
+// Stable identity for a task: a board task's id, else its words.
+const taskKey = (t) => (t.id != null ? `#${t.id}` : t.text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim());
+
+function applyPrefs(doc, prefs) {
+  const rank = new Map(prefs.order.map((a, i) => [a, i]));
+  for (const s of doc.sessions) {
+    s.tasks = (s.tasks ?? []).map((t) => {
+      const key = taskKey(t);
+      const level = prefs.priority[`${s.terminal}|${key}`];
+      return { ...t, key, priority: LEVELS.includes(level) ? level : "normal" };
+    });
+    s.rank = rank.has(s.terminal) ? rank.get(s.terminal) : null;
+  }
+  doc.prefs = prefs;
+  return doc;
+}
+
+// ---------- summaries ----------
+
+const SYSTEM = `You keep a glanceable task list for one coding-agent session that a person checks between other work.
+Return JSON only, no markdown:
+{"title": string, "now": string, "tasks": [{"text": string, "status": "in_progress" | "todo" | "done" | "blocked"}]}
+- title: 2-5 words naming what this session is about.
+- now: at most 80 characters. While working: what the agent is doing. Otherwise: the outcome, or what the person should do next. Plain words; never "Session complete" or "Done.".
+- tasks: 1-6 items the person asked for or the agent committed to. Outcomes, not individual tool calls. At most 60 characters each, starting with a verb.
+- Reuse the wording of previous tasks that still apply and update their status, so the list stays stable between updates. A previous task with a "priority" was ranked by the person: keep its text exactly, character for character, and keep it in the list until it is done.
+- "done" only when the conversation shows the work finished. "blocked" when it waits on the person: a question, an approval, a decision, a missing login. "in_progress" for what is being worked on now. "todo" for agreed work not started.
+- Keep at most 3 done tasks: the most recent ones. Order: blocked, in_progress, todo, done.
+- If the agent's status is "working", the newest request is not finished yet.`;
+
+function parseModelJson(text, maxTasks) {
+  const cleaned = text.replace(/```(?:json)?/g, "");
+  const a = cleaned.indexOf("{");
+  const b = cleaned.lastIndexOf("}");
+  if (a < 0 || b <= a) throw new Error("model reply had no JSON object");
+  const v = JSON.parse(cleaned.slice(a, b + 1));
+  const STATUSES = ["in_progress", "todo", "done", "blocked"];
+  const tasks = Array.isArray(v.tasks) ? v.tasks : [];
+  return {
+    title: String(v.title ?? "").slice(0, 60).trim() || null,
+    now: String(v.now ?? "").slice(0, 120).trim() || null,
+    tasks: tasks
+      .filter((t) => t && typeof t.text === "string" && t.text.trim())
+      .slice(0, maxTasks)
+      .map((t) => ({ text: t.text.trim().slice(0, 90), status: STATUSES.includes(t.status) ? t.status : "todo" })),
+  };
+}
+
+async function summarize({ status, name, cwd, first, conversation, previous, settings }) {
+  const payload = {
+    agent_status: status,
+    session_name: name,
+    folder: cwd,
+    first_request: first,
+    previous: previous ? { title: previous.title, now: previous.now, tasks: (previous.tasks ?? []).map((t) => ({ text: t.text, status: t.status, ...(t.priority && t.priority !== "normal" ? { priority: t.priority } : {}) })) } : null,
+    conversation,
+  };
+  const prompt = `Session data:\n${JSON.stringify(payload)}\n\nReturn the JSON task list now.`;
+  return parseModelJson(await callModel({ model: settings.values.model, system: SYSTEM, input: prompt, settings }), settings.values.maxTasksShown);
+}
+
+function boardTasks(board) {
+  const MAP = { pending: "todo", in_progress: "in_progress", completed: "done" };
+  const live = board.filter((t) => MAP[t.status]);
+  const open = live.filter((t) => t.status !== "completed");
+  const done = live.filter((t) => t.status === "completed").slice(-3);
+  const order = { in_progress: 0, todo: 1, done: 2 };
+  return [...open, ...done]
+    .map((t) => ({ id: t.id, text: t.status === "in_progress" && t.activeForm ? t.activeForm : t.subject, status: MAP[t.status] }))
+    .sort((a, b) => order[a.status] - order[b.status]);
+}
+
+// ---------- commands ----------
+
+async function refresh(space, force) {
+  const previous = await readJson(spaceFile(space), null);
+  const result = await withLock(space, async () => {
+    const index = await readIndex();
+    index.roots = index.roots ?? {};
+    const terms = await piTerminalsIn(space);
+    const mapping = await mapTerminals(terms, index, previous);
+    const prevBy = new Map((previous?.sessions ?? []).map((s) => [s.terminal, s]));
+    const now = Date.now();
+
+    const sessions = await pool(terms, MAX_PARALLEL, async (t) => {
+      const { file, mapping: how } = mapping.get(t.address);
+      const status = statusWord(t);
+      const cwd = t.foreground?.cwd || t.cwd;
+      const prev = prevBy.get(t.address);
+      // The project (git root) decides which project settings file counts for this session.
+      const root = cwd ? await gitRoot(cwd, index.roots) : null;
+      const settings = settingsFor(root);
+      const base = {
+        terminal: t.address,
+        tab: t.labels?.["herdr.tab"] ?? null,
+        pid: t.foreground?.pid ?? null,
+        cwd,
+        root,
+        model: settings.values.model,
+        status,
+        name: null,
+        file,
+        mapping: how,
+        title: null,
+        now: null,
+        tasks: [],
+        source: "none",
+        summarized_at: null,
+        fingerprint: null,
+        error: null,
+      };
+      if (!file) return { ...base, now: "Waiting for this session's first message" };
+      const info = index.files[file] ?? (await scanFile(file, await fs.stat(file), null));
+      index.files[file] = info;
+      base.name = info.name;
+      const fingerprint = `${info.size}`;
+      const same = prev && prev.file === file;
+
+      if (info.board && info.board.length) {
+        const at = Date.parse(info.boardAt ?? "") || now;
+        return { ...base, title: info.name, tasks: boardTasks(info.board), source: "board", summarized_at: at, fingerprint };
+      }
+      const fresh = same && prev.fingerprint === fingerprint && prev.status === status && prev.source === "haiku" && !prev.error;
+      const throttled = same && status === "working" && prev.status === "working" && prev.summarized_at && now - prev.summarized_at < settings.values.refreshSeconds * 1000;
+      if (!force && (fresh || throttled) && prev.model === base.model) return { ...prev, status, mapping: how, name: info.name, pid: base.pid, tab: base.tab, root };
+
+      try {
+        const conversation = await recentConversation(file);
+        if (!conversation.length) return { ...base, title: info.name, now: "No conversation yet", fingerprint };
+        const s = await summarize({ status, name: info.name, cwd, first: info.first, conversation, previous: same ? prev : null, settings });
+        return { ...base, ...s, title: s.title || info.name, source: "haiku", summarized_at: now, fingerprint };
+      } catch (e) {
+        // Keep the last good list, say why it is stale.
+        if (same && prev.tasks?.length) return { ...prev, status, mapping: how, error: String(e.message || e).slice(0, 400) };
+        return { ...base, title: info.name, error: String(e.message || e).slice(0, 400) };
+      }
+    });
+
+    await saveIndex(index);
+
+    const user = settingsFor(null);
+    const doc = applyPrefs(
+      { version: VERSION, space, model: user.values.model, settings_problems: [...new Set([user, ...sessions.map((s) => settingsFor(s.root))].flatMap((s) => s.problems.map((p) => p.message)))], updated_at: now, state: sessions.length ? "ready" : "empty", sessions },
+      await readPrefs(space),
+    );
+    await writeJsonAtomic(spaceFile(space), doc);
+    return doc;
+  });
+  if (result) return result;
+  return { ...(previous ?? { version: VERSION, space, sessions: [], updated_at: null, state: "empty" }), busy: true };
+}
+
+// ---------- explain in a split ----------
+// A right-click on a task or a session opens a new Pi beside the session it came from, on a fork
+// of that conversation (`pi --fork`: a copy; the original keeps going on its own), with a first
+// message asking it to explain. The person can then ask it to act; the prompt names the commands
+// that change the sidebar. This prints the command; the sidebar (or an agent) opens the pane with
+// `herdr-app do pane.split {pane, direction: "right", argv}`.
+
+const SPLIT_TAG = "[From the Todos sidebar]";
 
 async function explainTask(space, terminal, taskKey) {
   const doc = await readJson(spaceFile(space), null);
@@ -1064,37 +888,6 @@ async function explainTask(space, terminal, taskKey) {
   return { kind: task ? "task" : "session", terminal, name, folder, fork, prompt, argv: launchArgv({ folder, fork, name, prompt }) };
 }
 
-async function explainMemory(root, idArg) {
-  const ids = String(idArg).split(",").map((x) => x.trim()).filter(Boolean);
-  const store = await readStore(root);
-  const items = ids.map((id) => store.items.find((m) => m.id === id)).filter(Boolean);
-  if (!items.length) fail("NOT_FOUND", `no memory ${idArg} for ${root}`);
-  const withFile = [];
-  for (const m of items) if (m.source?.file && (await fs.stat(m.source.file).catch(() => null))) withFile.push(m);
-  const from = withFile[0] ?? null;
-  const line = store.rendered?.items?.find((it) => ids.every((id) => it.ids.includes(id)));
-  const kept = items.every((m) => m.status === "accepted");
-  const shown = line ? `${line.label ? `${line.label}: ` : ""}${line.text}` : items[0].text;
-  const helperPath = selfPath();
-  const lines = [MEMORY_TAG];
-  if (from) lines.push("This is a split of the conversation above: a copy. The original session keeps going on its own.");
-  lines.push("", kept ? `This rule is kept in ${path.join(root, MEMORY_FILE)}: "${shown}".` : `The sidebar suggests remembering this rule for the project: "${shown}".`);
-  for (const m of items) if (m.quote) lines.push(`The suggestion quoted: "${m.quote}"`);
-  if (from) lines.push("", "Explain where it came from in this conversation, briefly: which message, what I was reacting to, and whether it is a lasting rule for this project or only mattered for that task. Suggest clearer wording if it helps. Then wait for me.");
-  else lines.push("", `Its source conversation isn't available. Read ${MEMORY_FILE} and AGENTS.md here and explain, briefly, what the rule means for work in this project and whether it still fits. Suggest clearer wording if it helps. Then wait for me.`);
-  if (helperPath) {
-    const base = `node ${q(helperPath)} memory`;
-    const tail = `--root ${q(root)} --id ${ids.join(",")} --state ${q(stateDir)}`;
-    lines.push("", "When I decide, act with these (they update the sidebar and MEMORIES.md):");
-    if (!kept) lines.push(`- keep: ${base} accept ${tail} [--text "better wording"]`, `- dismiss: ${base} dismiss ${tail}`);
-    else lines.push(`- reword: ${base} edit ${tail} --text "new wording"`, `- remove: ${base} remove ${tail}`);
-  }
-  const name = short(`Explain: ${shown.replace(/^[^:]{1,30}:\s*/, "")}`, 48);
-  const folder = root;
-  const prompt = lines.join("\n");
-  return { kind: "memory", ids, name, folder, fork: from?.source.file ?? null, terminal: from?.source.terminal ?? null, prompt, argv: launchArgv({ folder, fork: from?.source.file ?? null, name, prompt }) };
-}
-
 const DESCRIBE = {
   name: "herdr-todos",
   version: VERSION,
@@ -1103,59 +896,31 @@ const DESCRIBE = {
     show: "show --space <id> [--state <dir>]: print the cached task lists without reading sessions or calling a model",
     order: "order --space <id> --terminals t1,t2,...: set the session order, most important first (sessions not listed follow)",
     priority: "priority --space <id> --terminal <t> --task <key> --level high|normal|low: rank one task (keys are in each task's `key`)",
-    memories: "memories --space <id> | --root <folder>: candidate and kept memories for the space's projects (git roots of its Pi sessions)",
-    memory: "memory accept|dismiss|edit|remove|restore --root <folder> --id <id> [--text <words>]; memory add --root <folder> --text <words>: accept rewrites <root>/MEMORIES.md (merged, grouped, terse) and links it from <root>/AGENTS.md; --id takes several ids (a,b) for a merged line",
-    explain: "explain --space <id> --terminal <t> [--task <key>] | explain --root <folder> --memory <id[,id]>: the command that opens a Pi beside the session on a fork of its conversation (`pi --fork`), asked to explain the task, session or memory and given the sidebar commands to act; open it with `herdr-app do pane.split '{\"pane\":...,\"direction\":\"right\",\"argv\":[...]}'`. Prints {kind, name, folder, fork, terminal, prompt, argv}",
+    explain: "explain --space <id> --terminal <t> [--task <key>]: the command that opens a Pi beside the session on a fork of its conversation (`pi --fork`), asked to explain the task or session and given the sidebar commands to act; open it with `herdr-app do pane.split '{\"pane\":...,\"direction\":\"right\",\"argv\":[...]}'`. Prints {kind, name, folder, fork, terminal, prompt, argv}",
+    config: "config: the settings in force and where each value came from (default, user file, project file, environment). config set <key> <value> [--project [folder]]: write one after checking it (user file, or <project>/.herdr/todos.json). config unset <key> [--project]. config path: the two files",
     describe: "this description",
   },
   output: {
     state: "ready | empty (no Pi sessions) | missing (never refreshed); busy: true when another refresh holds the space",
     prefs: "{order: [terminal...], priority: {\"<terminal>|<task key>\": high|low}} chosen by the person",
-    sessions: "[{terminal, tab, rank (position in prefs.order or null), status (working|blocked|done|idle|error), name, title, now, tasks: [{text, key, status: in_progress|todo|done|blocked, priority: high|normal|low}], source: board|haiku|none, mapping: label|name|name-newest|cached|newest|none, summarized_at, error}]",
+    sessions: "[{terminal, tab, rank (position in prefs.order or null), status (working|blocked|done|idle|error), name, title, now, root (git root), model, tasks: [{text, key, status: in_progress|todo|done|blocked, priority: high|normal|low}], source: board|haiku (a model wrote it)|none, mapping: label|name|name-newest|cached|newest|none, summarized_at, error}]",
+    settings_problems: "what is wrong in a settings file, in words; the defaults are used for those values",
   },
-  memory_output: "{projects: [{root, name, file, pending: [{id, text, kind: decision|preference|correction, quote, source, created_at}], kept: [{heading, items: [{label, text, ids}]}] (MEMORIES.md as written), accepted: [...], dismissed: count}]}. Candidates come from new prompts in Pi sessions during refresh; MEMORIES.md edits by hand are kept: a deleted line removes its memories, a new line becomes one.",
+  settings: describeSettings(),
+  settings_order: "defaults < user file < project file (<git root>/.herdr/todos.json) < environment < --model",
+  settings_files: { user: userSettingsFile(), project: "<project>/.herdr/todos.json", user_file_variable: "HERDR_TODOS_CONFIG" },
   state_dir: stateDir,
-  model,
-  compose_model: composeModel,
-  environment: {
-    HERDR_TODOS_MODEL: "model for task lists and memory suggestions (default anthropic/claude-haiku-4-5)",
-    HERDR_TODOS_COMPOSE_MODEL: "model that rewrites MEMORIES.md (default anthropic/claude-sonnet-5-5; falls back to HERDR_TODOS_MODEL)",
-    HERDR_TODOS_MODEL_CMD: 'JSON argv array run instead of Pi for every model call; gets {"model","system","input"} as JSON on stdin, prints the reply',
-    HERDR_TODOS_CONFIG: 'settings file (default ~/.config/herdr-todos/config.json): {"model", "compose_model", "model_cmd"}; the environment wins over it',
-  },
-  model_cmd: modelCmd,
-  settings_file: SETTINGS_FILE,
 };
 
 const cmd = args._[0];
 try {
   if (cmd === "describe") {
     process.stdout.write(JSON.stringify(DESCRIBE, null, 1) + "\n");
-  } else if (cmd === "memories") {
-    let roots;
-    if (typeof args.root === "string") roots = [path.resolve(expandHome(args.root))];
-    else if (typeof args.space === "string") {
-      const doc = await readJson(spaceFile(args.space), null);
-      roots = [...new Set((doc?.sessions ?? []).map((x) => x.root).filter(Boolean))];
-    } else fail("INVALID", "--space <id> or --root <folder> is required");
-    process.stdout.write(JSON.stringify({ space: args.space ?? null, projects: await memoriesFor(roots) }) + "\n");
-  } else if (cmd === "memory") {
-    const action = args._[1];
-    if (typeof args.root !== "string") fail("INVALID", "--root <project folder> is required");
-    if (action !== "add" && typeof args.id !== "string") fail("INVALID", "--id is required");
-    const root = path.resolve(expandHome(args.root));
-    const m = await memoryAction(action, root, args.id, typeof args.text === "string" ? args.text : null);
-    process.stdout.write(JSON.stringify({ root, memory: m }) + "\n");
+  } else if (cmd === "config") {
+    await configCommand();
   } else if (cmd === "explain") {
-    let out;
-    if (typeof args.memory === "string") {
-      if (typeof args.root !== "string") fail("INVALID", "--root <project folder> is required with --memory");
-      out = await explainMemory(path.resolve(expandHome(args.root)), args.memory);
-    } else {
-      if (typeof args.space !== "string" || typeof args.terminal !== "string") fail("INVALID", "--space and --terminal (or --root and --memory) are required");
-      out = await explainTask(args.space, args.terminal, typeof args.task === "string" ? args.task : null);
-    }
-    process.stdout.write(JSON.stringify(out) + "\n");
+    if (typeof args.space !== "string" || typeof args.terminal !== "string") fail("INVALID", "--space and --terminal are required");
+    print(await explainTask(args.space, args.terminal, typeof args.task === "string" ? args.task : null));
   } else if (cmd === "order" || cmd === "priority") {
     if (typeof args.space !== "string") fail("INVALID", "--space <id> is required");
     const prefs = await readPrefs(args.space);

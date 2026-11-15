@@ -1,6 +1,4 @@
 node_modules/
-# A global gitignore may ignore "memories/"; this folder is the Memories widget and must be tracked.
-!memories/
 # Written by the Herdr app into every mod folder.
 gpui-kit.d.ts
 # Local notes, caches and results
